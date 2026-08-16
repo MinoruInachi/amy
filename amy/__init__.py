@@ -7,12 +7,14 @@ def _get_synth_commands_stub(synth, include_fx=False):
     return []
 
 _get_synth_commands = _get_synth_commands_stub
+_sequencer_ticks = lambda: 0
 try:
     import c_amy as _amy  # Import the C module
     live = _amy.live
     _get_synth_commands = _amy.get_synth_commands
     _set_cv_from_osc = _amy.set_cv_from_osc
     _ticks_ms = _amy.ticks_ms
+    _sequencer_ticks = getattr(_amy, 'sequencer_ticks', _sequencer_ticks)
     _render_load = _amy.render_load
     _set_render_load_threshold = _amy.set_render_load_threshold
 except (ImportError, AttributeError):
@@ -21,11 +23,14 @@ except (ImportError, AttributeError):
     _set_cv_from_osc = lambda c, o: None
     try:
         import tulip
-        _get_synth_commands = tulip.amy_get_synth_commands
-        _ticks_ms = tulip.amy_ticks_ms
-        _render_load = tulip.amy_render_load
-        _set_render_load_threshold = tulip.amy_set_render_load_threshold
-    except (ImportError, AttributeError):
+        # Bind each independently: a Tulip build that is missing one of these
+        # should lose only that function, not every assignment after it.
+        _get_synth_commands = getattr(tulip, 'amy_get_synth_commands', _get_synth_commands)
+        _ticks_ms = getattr(tulip, 'amy_ticks_ms', None)
+        _sequencer_ticks = getattr(tulip, 'amy_sequencer_ticks', _sequencer_ticks)
+        _render_load = getattr(tulip, 'amy_render_load', None)
+        _set_render_load_threshold = getattr(tulip, 'amy_set_render_load_threshold', None)
+    except ImportError:
         pass  # Not available (e.g. web build); _get_synth_commands returns []
 
 
