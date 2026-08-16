@@ -346,6 +346,11 @@ def inject_midi_bytes(data, usb=0):
 def ticks_ms():
     return _ticks_ms()
 
+# The sequencer's tick counter, for scheduling messages at an absolute tick
+# (the `ticks=` argument of note_on / the `sequence` parameter).
+def sequencer_ticks():
+    return _sequencer_ticks()
+
 def unload_sample(patch=0):
     s= "%d,%d" % (patch, 0)
     send(load_sample=s)
