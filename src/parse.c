@@ -4,6 +4,7 @@
 #include "amy.h"
 #include "transfer.h"  // for amy_dump_state_to_sysex, amy_dump_file_to_sysex
 #include <ctype.h>  // for isalpha().
+#include <assert.h>
 #if defined(TULIP) || defined(AMYBOARD)
 #include "py/runtime.h"
 #endif
@@ -278,6 +279,17 @@ static void parse_event_breakpoints(char *message, uint32_t *times_ms, float *va
     }
 }
 
+// helper to parse the list of modulating oscs ("L3", or "L3,4" for both slots)
+void parse_mod_source(char *message, uint16_t *vals) {
+    int num_parsed = parse_list_uint16_t(message, vals, NUM_MOD_SOURCES,
+                                         AMY_UNSET_VALUE(vals[0]));
+    // Slots this message didn't mention keep whatever they already had, so
+    // clear them in the *event* (an unset event field is "don't change").
+    for (int i = num_parsed; i < NUM_MOD_SOURCES; ++i) {
+        AMY_UNSET(vals[i]);
+    }
+}
+
 // helper to parse the list of source oscs for an algorithm
 void parse_algo_source(char *message, int16_t *vals) {
     int num_parsed = parse_list_int16_t(message, vals, MAX_ALGO_OPS,
@@ -336,6 +348,10 @@ int midi_mapping_from_message(char *message, char cmd, int instr_num, int skip_c
     // ic255 clears all MIDI CC mappings for this synth (short form, no extra fields needed).
     size_t pos = 0;
     size_t mlen = strlen(message);
+    // An empty payload ("ic"/"io" at end of message) would return -1 below,
+    // which exactly cancels the outer parser's advance and wedges it in an
+    // infinite loop on the same 'i'.
+    if (mlen == 0) return 0;
     while (pos < mlen) {
         // Break the mapping on ZZs (for K257).
         size_t sub_mlen, next_pos;
@@ -460,6 +476,24 @@ int amy_parse_synth_layer_message(char *message, amy_event *e) {
     return skip_chars;
 }
 
+// Parse a sample-load parameter list ('z'/'zS' messages): comma-separated
+// unsigned integers, except the midinote field which may be fractional (e.g.
+// a sample tuned 4 cents sharp of C4 is "60.04"). parse_list_uint32_t cannot
+// parse these lists: its leading charset scan treats the list as ending at
+// the first '.', which would silently zero every field after a fractional
+// midinote. Absent fields parse as 0.
+static void parse_sample_load_params(char *message, uint32_t *vals, int num_vals,
+                                     int midinote_field, float *midinote) {
+    *midinote = 0;
+    uint16_t c = 0;
+    for (int f = 0; f < num_vals; ++f) {
+        vals[f] = (uint32_t)strtoul(message + c, NULL, 10);
+        if (f == midinote_field) *midinote = atoff(message + c);
+        while (message[c] != ',' && message[c] != 0 && c < MAX_MESSAGE_LEN) c++;
+        if (message[c] == ',') c++;
+    }
+}
+
 // Parser for transfer-layer ('z') prefix. Returns how much of a message to skip
 uint16_t amy_parse_transfer_layer_message(char *message) {
 
@@ -467,11 +501,13 @@ uint16_t amy_parse_transfer_layer_message(char *message) {
         // z: Signal to start loading sample. 
         // Params: preset number, length(frames), samplerate, midinote, loopstart, loopend. 
         uint32_t sm[6]; // preset, length, SR, midinote, loop_start, loopend
-        parse_list_uint32_t(message, sm, 6, 0);
+        float midinote;
+        parse_sample_load_params(message, sm, 6, 3, &midinote);
         if(sm[1]==0) { // remove preset
             pcm_unload_preset(sm[0]);
         } else {
-            int16_t * ram = pcm_load(sm[0], sm[1], sm[2], 1, sm[3], sm[4], sm[5]);
+            amy_execute_deltas();
+            int16_t * ram = pcm_load(sm[0], sm[1], sm[2], 1, midinote, sm[4], sm[5]);
             start_receiving_transfer(sm[1]*2, (uint8_t*)ram);
         }
         return 0;
@@ -517,8 +553,9 @@ uint16_t amy_parse_transfer_layer_message(char *message) {
         // zS: sample from BUS[1] to a memorypcm patch. 
         // Params: Preset number,  bus, max length in frames,midinote,loopstart,loopend
         uint32_t sm[6]; // preset, bus, max frames, midinote, loop_start, loopend
-        parse_list_uint32_t(message, sm, 6, 0);
-        int16_t * ram = pcm_load(sm[0], sm[2], AMY_SAMPLE_RATE, 2, sm[3], sm[4], sm[5]);
+        float midinote;
+        parse_sample_load_params(message, sm, 6, 3, &midinote);
+        int16_t * ram = pcm_load(sm[0], sm[2], AMY_SAMPLE_RATE, 2, midinote, sm[4], sm[5]);
         start_receiving_sample(sm[2], sm[1], ram);
         return 1;
     }
@@ -555,36 +592,6 @@ uint16_t amy_parse_transfer_layer_message(char *message) {
         {
             uint16_t total = 0;
             const char *scan = message - 1;  // back to 'D'
-            while (scan[total]) total++;
-            return total;
-        }
-    }
-    else if (cmd == 'A') {
-        // zA: Update sketch.py on disk with current AMY state (calls update_file_hook).
-        // Takes optional filename; defaults to /user/current/sketch.py on AMYboard.
-        // Payload semantics match zD: the filename is "rest of message", a
-        // trailing 'Z' terminator is stripped, and interior capital-Z chars
-        // in the filename are preserved.
-        char filename[MAX_FILENAME_LEN];
-        uint16_t len = 0;
-        while (message[len] && len < MAX_FILENAME_LEN - 1) {
-            filename[len] = message[len];
-            len++;
-        }
-        filename[len] = '\0';
-        if (len > 0 && filename[len - 1] == 'Z') {
-            filename[--len] = '\0';
-        }
-        if (amy_global.config.amy_external_update_file_hook) {
-            if (filename[0]) {
-                amy_global.config.amy_external_update_file_hook(filename);
-            } else {
-                amy_global.config.amy_external_update_file_hook("/user/current/sketch.py");
-            }
-        }
-        {
-            uint16_t total = 0;
-            const char *scan = message - 1;
             while (scan[total]) total++;
             return total;
         }
@@ -659,33 +666,39 @@ size_t yield_event_from_message(char *message, amy_event *e, size_t pos) {
     return pos;
 }
 
+// Called from amy_add_message when the first char is 'H', indicating a ticks message.
+// It claims the rest of the message as its payload -- stored as a raw
+// wire string and only parsed when it comes due -- so a schedule command
+// is only ever honored as the first command of a message.
+void handle_ticks_message(char *message) {
+    assert(message[0] == 'H');
+    uint32_t ticks[3] = {0, 0, 0};
+    int num_vals = parse_list_uint32_t(message + 1, ticks, 3, 0);
+    uint16_t schedule_len = 1 + _next_alpha(message + 1);
+    char *payload = message + schedule_len;
+    uint16_t payload_len = (uint16_t)strlen(payload);
+    char *stripped = (char *)malloc_caps(payload_len + 1, amy_global.config.ram_caps_events);
+    if (stripped == NULL) {
+        amy_oom("ticks_message");
+    } else {
+        memcpy(stripped, payload, payload_len + 1);
+        // A tag is only "given" if all 3 values were present; fewer
+        // than that (a 1- or 2-value ticks=) stores anonymously.
+        sequencer_add_wire(ticks[TICKS_TICK], ticks[TICKS_PERIOD], ticks[TICKS_TAG],
+                           num_vals >= 3, stripped);
+    }
+}
 
 // given a string return a parsed event
+//
+// Transfer payloads never reach here: amy_add_message() traps them before
+// any parsing is attempted (see the comment there), so this only ever sees
+// real wire commands.
 int amy_parse_message(char * message, amy_event *e) {
     peek_stack("parse_message");
     int length = strlen(message);
     char cmd = '\0';
     uint16_t pos = 0;
-
-    // Check if we're in a transfer block, if so, parse it and leave this loop.
-    // FILE transfers (zT, used to write files over MIDI sysex) arrive async
-    // while a sketch may also be running, so we ONLY route them to the
-    // transfer handler when the data is sysex-originated -- otherwise a
-    // sketch calling amy.send(note=36) mid-transfer would get its wire
-    // command base64-decoded as file data and corrupt the file.
-    //
-    // AUDIO transfers (amy.load_sample / load_sample_bytes) are different:
-    // Python sends every chunk synchronously in a tight loop within the same
-    // call, so no other amy.send() can interleave. They route regardless of
-    // the sysex flag (which they don't carry, since send_raw goes through
-    // the regular wire path).
-    extern bool amy_parsing_from_sysex;
-    if (amy_global.transfer_flag == AMY_TRANSFER_TYPE_AUDIO ||
-        (amy_parsing_from_sysex && amy_global.transfer_flag == AMY_TRANSFER_TYPE_FILE)) {
-        parse_transfer_message(message, length);
-        e->status = EVENT_TRANSFER_DATA;
-        return length;
-    }
 
     while(pos < length) {
         cmd = message[pos];
@@ -716,7 +729,8 @@ int amy_parse_message(char * message, amy_event *e) {
             case 'F': parse_coef_message(arg, e->filter_freq_coefs); break;
             case 'G': e->filter_type = atoi(arg); break;
             /* g used for Alles for client # */
-            case 'H': parse_list_uint32_t(arg, e->sequence, 3, 0); break;
+            // 'H' is the ticks= schedule command, it's caught in amy_add_message before this.
+            //case 'H': parse_list_uint32_t(arg, e->ticks, 3, 0); break;
             case 'h': if (AMY_HAS_REVERB) {
                 float reverb_params[4];
                 parse_list_float(arg, reverb_params, 4, AMY_UNSET_VALUE(e->reverb_level));
@@ -743,7 +757,7 @@ int amy_parse_message(char * message, amy_event *e) {
             break;
             case 'K': e->patch_number = atoi(arg); break;
             case 'l': e->velocity=atoff(arg); break;
-            case 'L': e->mod_source=atoi(arg); break;
+            case 'L': parse_mod_source(arg, e->mod_source); break;
             case 'm': e->portamento_ms=atoi(arg); break;
             case 'M': if (AMY_HAS_ECHO) {
                 float echo_params[5];
@@ -763,38 +777,48 @@ int amy_parse_message(char * message, amy_event *e) {
             case 'P': e->trigger_phase=atoff(arg); break;
             /* q unused */
             case 'Q': parse_coef_message(arg, e->pan_coefs); break;
-            case 'r': parse_voices(arg, e->voices); break;
+            //case 'r': parse_voices(arg, e->voices); break;  // 'r' deprecated, you basically never control a voice directly from the API.  Planning to use it for multi-amyboard.
             case 'R': e->resonance=atoff(arg); break;
             case 's': e->pitch_bend = atoff(arg); break;
             case 'S':
                 e->reset_osc = atoi(arg);
-                // if we're resetting all of AMY, do it now
-                if (e->reset_osc & (RESET_AMY | RESET_TIMEBASE | RESET_EVENTS | RESET_SYNTHS)) {
+                // These two can only happen here, on the parse side, because
+                // neither survives being carried IN a delta: RESET_AMY tears
+                // AMY down and restarts it, and RESET_EVENTS empties the very
+                // queue the delta would be sitting in.  Every other reset bit
+                // -- RESET_TIMEBASE included -- travels as an ordinary delta,
+                // so it works identically from amy_add_event() and honours
+                // time=/ticks= like the rest of the API.
+                if (e->reset_osc & (RESET_AMY | RESET_EVENTS)) {
                     if(e->reset_osc & RESET_AMY) {
                         amy_stop();
                         amy_start(amy_global.config);
                     }
-                    // if we're resetting timebase, do it NOW
-                    if(e->reset_osc & RESET_TIMEBASE) {
-                        amy_reset_sysclock();
-                    }
                     if(e->reset_osc & RESET_EVENTS) {
                         amy_deltas_reset();
                     }
-                    if(e->reset_osc & RESET_SYNTHS) {
-                        amy_reset_oscs();
-                    }
-                    AMY_UNSET(e->reset_osc);
+                    // Clear only the bits handled here.  Unsetting the whole
+                    // field dropped everything it was combined with, so e.g.
+                    // RESET_EVENTS|RESET_ALL_OSCS silently skipped the osc
+                    // reset.  Unset it entirely if nothing is left, since a
+                    // reset_osc of 0 means "reset oscillator 0".
+                    e->reset_osc &= ~(uint32_t)(RESET_AMY | RESET_EVENTS);
+                    if (e->reset_osc == 0)  AMY_UNSET(e->reset_osc);
                 }
                 break;
-            /* t used for time */
-            case 't': e->time=atol(arg); break;
+            /* t no longer used (was time=) */
             case 'T': e->eg_type[0] = atoi(arg); break;
             case 'u': patches_store_patch(e, arg); pos = strlen(message) - 1; break;  // patches_store_patch processes the patch as all the rest of the message and maybe sets patch.
             /* U used by Alles for sync */
             case 'v': e->osc=((atoi(arg)) % (AMY_OSCS+1));  break; // allow osc wraparound
-            case 'V': parse_list_float(arg, e->volume, AMY_NUM_BUSES, AMY_UNSET_VALUE(e->volume[0])); break;
-            case 'w': e->wave=atoi(arg); break;
+            case 'V': e->volume = atoff(arg); break;
+            case 'w': if (arg[0] == 'w') {  // 'ww' is wave submode.
+                    e->mode=atoi(arg + 1);
+                    ++pos;
+                } else {
+                    e->wave=atoi(arg);
+                }
+                break;
             /* W used by Tulip for CV, external_channel */
             case 'X': e->eg_type[1] = atoi(arg); break;
             case 'x': {

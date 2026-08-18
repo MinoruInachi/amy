@@ -32,10 +32,16 @@ AMY_IRAM_ATTR SAMPLE compute_mod_value(uint16_t mod_osc) {
     return value;
 }
 
-AMY_IRAM_ATTR SAMPLE compute_mod_scale(uint16_t osc) {
-    uint16_t source = synth[osc]->mod_source;
+AMY_IRAM_ATTR SAMPLE compute_mod_scale(uint16_t osc, uint16_t which_source) {
+    // hold_and_modify(source) evaluates the modulator's own COEF_MOD* inputs,
+    // so modulators can themselves be modulated (chained modulators). Cycles
+    // are rejected at assignment time (mod_osc_would_cause_loop in amy.c), so
+    // the recursion is bounded; the per-block memo in compute_mod_value keeps
+    // shared modulators cheap -- including one shared between an osc's own two
+    // mod slots.
+    uint16_t source = synth[osc]->mod_source[which_source];
     if(AMY_IS_SET(source)) {
-        if(source != osc) {  // that would be weird
+        if(source != osc) {  // belt-and-braces; assignment already rejects this
             hold_and_modify(source);
             return compute_mod_value(source);
         }
@@ -118,7 +124,6 @@ AMY_IRAM_ATTR SAMPLE compute_breakpoint_scale(uint16_t osc, uint8_t bp_set, uint
         if(elapsed > synth[osc]->breakpoint_times[bp_set][bp_r]) {
             //printf("cbp: time %f osc %d amp %f OFF\n", amy_global.total_blocks*AMY_BLOCK_SIZE / (float)AMY_SAMPLE_RATE, osc, msynth[osc]->amp);
             // Synth is now turned off in hold_and_modify, which tracks when the amplitude goes to zero (and waits a bit).
-            //synth[osc]->status=SYNTH_OFF;
             //AMY_UNSET(synth[osc]->note_off_clock);
             scale = F2S(synth[osc]->breakpoint_values[bp_set][bp_r]);
             synth[osc]->last_scale[bp_set] = scale;
@@ -140,7 +145,7 @@ AMY_IRAM_ATTR SAMPLE compute_breakpoint_scale(uint16_t osc, uint8_t bp_set, uint
         sign = -1;
         v0 = -v0; v1 = -v1;
     }
-    if(t1==t0 || elapsed==t1) {
+    if(t1==t0 || elapsed==t1 || v1 == v0) {
         // This way we return exact zero for v1 at the end of the segment, rather than BREAKPOINT_EPS
         scale = v1;
     } else {
@@ -166,8 +171,12 @@ AMY_IRAM_ATTR SAMPLE compute_breakpoint_scale(uint16_t osc, uint8_t bp_set, uint
 #define MIN_LEVEL_S 4.25f
 #define ATTACK_RANGE_S 9.375f
 #define MAP_ATTACK_LEVEL_S(level) (1 - MAX(level - MIN_LEVEL_S, 0) / ATTACK_RANGE_S)
-                SAMPLE mapped_current_level = F2S(MAP_ATTACK_LEVEL_S(LINEAR_SAMP_TO_DX7_LEVEL(v0)));
-                SAMPLE mapped_target_level = F2S(MAP_ATTACK_LEVEL_S(LINEAR_SAMP_TO_DX7_LEVEL(v1)));
+                // MAP_ATTACK_LEVEL_S reaches zero (and goes negative) once the
+                // DX7 level passes 13.625, which a breakpoint value above ~2.37
+                // does. log2_lut needs a positive argument, so floor these the
+                // same way v0/v1 are floored in the decay branch below.
+                SAMPLE mapped_current_level = MAX(F2S(MAP_ATTACK_LEVEL_S(LINEAR_SAMP_TO_DX7_LEVEL(v0))), F2S(BREAKPOINT_EPS));
+                SAMPLE mapped_target_level = MAX(F2S(MAP_ATTACK_LEVEL_S(LINEAR_SAMP_TO_DX7_LEVEL(v1))), F2S(BREAKPOINT_EPS));
                 float t_const = (t1 - t0) / S2F(log2_lut(mapped_current_level) - log2_lut(mapped_target_level));
                 float my_t0 = -t_const * S2F(log2_lut(mapped_current_level));
                 // This is the magic equation that shapes the DX7 attack envelopes.
@@ -203,8 +212,11 @@ AMY_IRAM_ATTR SAMPLE compute_breakpoint_scale(uint16_t osc, uint8_t bp_set, uint
         scale = -scale;  // does not mix well with no_amp_001
     }
     // Keep track of the most-recently returned non-release scale.
-    //if (osc < AMY_OSCS && found != -1)
-    //    fprintf(stderr, "env: time %f osc %d bpset %d seg %d type %d t0 %d t1 %d elapsed %d v0 %f v1 %f scale %f\n", amy_global.total_blocks*AMY_BLOCK_SIZE / (float)AMY_SAMPLE_RATE, osc, bp_set, found, eg_type, t0, t1, elapsed, S2F(v0), S2F(v1), S2F(scale));
+    //static int last_seg = -1;
+    //if (osc < AMY_OSCS && found != -1 && last_seg != found) {
+    //  fprintf(stderr, "\renv: time %f osc %d bpset %d seg %d type %d t0 %d t1 %d elapsed %d v0 %f v1 %f scale %f\n", amy_global.total_blocks*AMY_BLOCK_SIZE / (float)AMY_SAMPLE_RATE, osc, bp_set, found, eg_type, t0, t1, elapsed, S2F(v0), S2F(v1), S2F(scale));
+    //  last_seg = found;
+    //}
     AMY_PROFILE_STOP(COMPUTE_BREAKPOINT_SCALE)
     return scale;
 }

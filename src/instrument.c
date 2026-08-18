@@ -38,6 +38,10 @@ struct voice_fifo *voice_fifo_init(int size, const char *name) {
         return NULL;
     }
     struct voice_fifo *result = (struct voice_fifo *)malloc_caps(sizeof(struct voice_fifo), amy_global.config.ram_caps_synth);
+    if (result == NULL) {
+        amy_oom("init_voice_fifo: out of memory\n");
+        return NULL;
+    }
     result->head = 0;
     result->tail = 0;
     result->length = MAX_VOICES_PER_INSTRUMENT + 1;  // One more than max size.  fixed in this implementation.
@@ -105,7 +109,7 @@ struct instrument_info {
     uint8_t num_voices;
     uint8_t oscs_per_voice; // How many oscs each voice uses.  Stored for convenience.
     uint8_t id;             // synth number assigned by client.
-    uint8_t bus;            // which bus this instrument ends up on.
+    uint16_t bus;           // which bus this instrument ends up on.
     uint16_t patch_number;  // What patch this instrument is currently set to.  Stored for convenience.
     int16_t bank_number;    // Optional top-7-bit word of Program, set by MIDI CC 0 (-1 if not set).
     uint32_t flags;         // Bitmask of special instrument properties (for MIDI Drums translation).
@@ -166,8 +170,13 @@ float instrument_level_for_voice(uint16_t voice) {
     return voice_level[voice];
 }
 
-struct instrument_info *instrument_init(int id, int num_voices, uint16_t* amy_voices, uint16_t patch_number, uint16_t oscs_per_voice, uint8_t bus, uint32_t flags) {
+struct instrument_info *instrument_init(int id, int num_voices, uint16_t* amy_voices, uint16_t patch_number, uint16_t oscs_per_voice, uint16_t bus, uint32_t flags) {
     struct instrument_info *instrument = (struct instrument_info *)malloc_caps(sizeof(struct instrument_info), amy_global.config.ram_caps_synth);
+    // NULL already means "synth not defined" to all callers.
+    if (instrument == NULL) {
+        amy_oom("instrument_init: out of memory for synth %d\n", id);
+        return NULL;
+    }
     instrument->id = id;
     if (num_voices <= 0 || num_voices > MAX_VOICES_PER_INSTRUMENT) {
         fprintf(stderr, "num_voices %d not within 1 .. MAX_VOICES_PER_INSTRUMENT %d\n", num_voices, MAX_VOICES_PER_INSTRUMENT);
@@ -178,7 +187,7 @@ struct instrument_info *instrument_init(int id, int num_voices, uint16_t* amy_vo
     instrument->patch_number = patch_number;
     instrument->oscs_per_voice = oscs_per_voice;
     instrument->bank_number = -1;
-    instrument->bus = bus;
+    instrument->bus = amy_validate_bus(bus);
     instrument->flags = flags;
     instrument->level = 1.0f;
     instrument->noteon_delay_ms = 0;
@@ -186,6 +195,12 @@ struct instrument_info *instrument_init(int id, int num_voices, uint16_t* amy_vo
     instrument->grab_midi_notes = true;
     instrument->released_voices = voice_fifo_init(num_voices, "released");
     instrument->active_voices = voice_fifo_init(num_voices, "active");
+    if (instrument->released_voices == NULL || instrument->active_voices == NULL) {
+        voice_fifo_free(instrument->active_voices);
+        voice_fifo_free(instrument->released_voices);
+        free(instrument);
+        return NULL;
+    }
     for (uint8_t voice = 0; voice < num_voices; ++voice) {
         instrument->amy_voices[voice] = amy_voices[voice];
         voice_fifo_put(instrument->released_voices, voice);
@@ -227,8 +242,9 @@ void _instrument_push_note_forgotten(struct instrument_info *instrument, uint16_
         //fprintf(stderr, "synth %d: caching new forgotten note %d/%d (%d, count %d)\n",
         //        instrument->id, note / 128, note & 0x7F, available_index, instrument->forgotten_note_count[available_index]);
     } else {
-        fprintf(stderr, "**_instrument_push_forgotten_note: forgotten pool overflow synth %d note %d/%d\n",
-                instrument->id, note / 128, note & 0x7F);
+        if (!(instrument->flags & SYNTH_FLAGS_NO_NOTE_WARNINGS))
+            fprintf(stderr, "**_instrument_push_forgotten_note: forgotten pool overflow synth %d note %d/%d\n",
+                    instrument->id, note / 128, note & 0x7F);
     }
 }
 
@@ -279,7 +295,8 @@ uint16_t instrument_note_off(struct instrument_info *instrument, uint16_t note) 
     uint16_t voice = _instrument_voice_for_note(instrument, note);
     if (voice == _INSTRUMENT_NO_VOICE) {
         // Don't report an unmatched note-off if it was a victim of stealing.
-        if (!_instrument_pop_note_forgotten(instrument, note))
+        if (!_instrument_pop_note_forgotten(instrument, note)
+            && !(instrument->flags & SYNTH_FLAGS_NO_NOTE_WARNINGS))
             fprintf(stderr, "note off for %d/%d does not match note on\n", note / 128, note & 0x7F);
         //instrument_debug(instrument);
         return _INSTRUMENT_NO_VOICE;  // We could just fall through, but this is more explicit.
@@ -309,7 +326,8 @@ int _instrument_all_notes_off(struct instrument_info *instrument, uint16_t *amy_
 uint16_t instrument_note_on(struct instrument_info *instrument, uint16_t note, bool *pstolen) {
     if ((note & 0x7F) == 0) {
         // note == 0 is for all-notes-off, it's not allowed for note-on (sorry, C-1).
-        fprintf(stderr, "note-on for note 0: ignored.\n");
+        if (!(instrument->flags & SYNTH_FLAGS_NO_NOTE_WARNINGS))
+            fprintf(stderr, "note-on for note 0: ignored.\n");
         return _INSTRUMENT_NO_VOICE;
     }
     uint16_t voice = _instrument_voice_for_note(instrument, note);
@@ -372,6 +390,9 @@ void instrument_release(int instrument_number) {
         instrument_free(instruments[instrument_number]);
     }
     instruments[instrument_number] = NULL;
+    // Unless there are active midi_mappings, stop listening to this channel.
+    if (!midi_mappings_exist_for_channel(instrument_number))
+        midi_active_channel_set(instrument_number, false);
 }
 
 bool instrument_number_ok(int instrument_number, const char *tag) {
@@ -392,12 +413,14 @@ bool instrument_number_exists(int instrument_number, const char *tag) {
     return false;
 }
 
-void instrument_add_new(int instrument_number, int num_voices, uint16_t *amy_voices, uint16_t patch_number, uint16_t oscs_per_voice, uint8_t bus, uint32_t flags) {
+void instrument_add_new(int instrument_number, int num_voices, uint16_t *amy_voices, uint16_t patch_number, uint16_t oscs_per_voice, uint16_t bus, uint32_t flags) {
     if (!instrument_number_ok(instrument_number, "add_new")) return;
     if(instruments[instrument_number]) {
         instrument_free(instruments[instrument_number]);
     }
     instruments[instrument_number] = instrument_init(instrument_number, num_voices, amy_voices, patch_number, oscs_per_voice, bus, flags);
+    // Make sure we start listning to this channel.
+    midi_active_channel_set(instrument_number, true);
 }
 
 void instrument_change_number(int old_instrument_number, int new_instrument_number) {
@@ -485,10 +508,12 @@ int instrument_get_bus(int instrument_number) {
     return instrument->bus;
 }
 
-void instrument_set_bus(int instrument_number, uint8_t bus) {
+void instrument_set_bus(int instrument_number, uint16_t bus) {
     if (!instrument_number_exists(instrument_number, "set_bus")) return;
     struct instrument_info *instrument = instruments[instrument_number];
-    instrument->bus = bus;
+    // An instrument's bus is read back later and used to index the bus tables
+    // (set_event_for_bus_fx), so it can't be allowed to go stale or wild.
+    instrument->bus = amy_validate_bus(bus);
 }
 
 float instrument_get_level(int instrument_number) {

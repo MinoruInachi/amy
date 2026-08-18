@@ -3,6 +3,7 @@
 
 #include "amy.h"
 #include "delay.h"
+#include <stdarg.h>
 
 // A microsecond wall clock, used for the per-block render load measure and (under
 // AMY_DEBUG) the profiler.
@@ -166,8 +167,9 @@ struct synthinfo ** synth;
 struct mod_synthinfo ** msynth;
 
 // Two mixing blocks, one per core of rendering
-SAMPLE *fbl[AMY_MAX_CORES][AMY_NUM_BUSES];
-SAMPLE *per_osc_fb[AMY_MAX_CORES][AMY_NUM_BUSES];
+// Inner arrays are max_buses long, allocated in oscs_init.
+SAMPLE **fbl[AMY_MAX_CORES];
+SAMPLE **per_osc_fb[AMY_MAX_CORES];
 SAMPLE core_max[AMY_MAX_CORES];
 
 // Public pointer to recently-emitted waveform block.
@@ -217,8 +219,38 @@ output_sample_type * output_block;
   }
 #endif
 
+// All runtime allocation failures report through here: count, log, and under
+// AMY_DEBUG abort() at the cause instead of degrading silently. Only the
+// first failure is logged: this can run on the render thread, where stdio
+// blocks, and failed allocations retry (and re-fail) on every note-on.
+// Poll amy_get_oom_count() for ongoing failures.
+void amy_oom(const char *fmt, ...) {
+    if (++amy_global.oom_count == 1) {
+        va_list ap;
+        va_start(ap, fmt);
+        vfprintf(stderr, fmt, ap);
+        va_end(ap);
+    }
+#ifdef AMY_DEBUG
+    abort();
+#endif
+}
 
-void dealloc_echo_delay_lines(uint8_t bus) {
+uint32_t amy_get_oom_count() {
+    return amy_global.oom_count;
+}
+
+uint16_t amy_validate_bus(int bus) {
+    if (bus < 0 || bus >= amy_global.config.max_buses) {
+        fprintf(stderr, "bus %d out of range 0..%d, using bus %d\n",
+                bus, amy_global.config.max_buses - 1, AMY_DEFAULT_BUS);
+        return AMY_DEFAULT_BUS;
+    }
+    return (uint16_t)bus;
+}
+
+
+void dealloc_echo_delay_lines(uint16_t bus) {
     for (int c = AMY_NCHANS - 1; c >= 0; --c) {
         if (amy_global.bus[bus]->echo.echo_delay_lines[c])
             free_delay_line(amy_global.bus[bus]->echo.echo_delay_lines[c]);
@@ -226,7 +258,7 @@ void dealloc_echo_delay_lines(uint8_t bus) {
     }
 }
 
-bool alloc_echo_delay_lines(uint8_t bus, uint32_t max_delay_samples) {
+bool alloc_echo_delay_lines(uint16_t bus, uint32_t max_delay_samples) {
     bool success = true;
     for (int c = 0; c < AMY_NCHANS; ++c) {
         delay_line_t *delay_line = new_delay_line(max_delay_samples, 0, amy_global.config.ram_caps_delay);
@@ -251,7 +283,7 @@ uint32_t enclosing_power_of_2(uint32_t n) {
     return result;
 }
 
-void config_echo(uint8_t bus, float level, float delay_ms, float max_delay_ms, float feedback, float filter_coef) {
+void config_echo(uint16_t bus, float level, float delay_ms, float max_delay_ms, float feedback, float filter_coef) {
     if (AMY_IS_UNSET(level)) level = S2F(amy_global.bus[bus]->echo.level);
     if (AMY_IS_UNSET(delay_ms)) delay_ms = (amy_global.bus[bus]->echo.delay_samples + 0.5f) / (AMY_SAMPLE_RATE / 1000.f);
     if (AMY_IS_UNSET(max_delay_ms)) max_delay_ms = (amy_global.bus[bus]->echo.max_delay_samples + 0.5f) / (AMY_SAMPLE_RATE / 1000.f);
@@ -287,7 +319,7 @@ void config_echo(uint8_t bus, float level, float delay_ms, float max_delay_ms, f
     //fprintf(stderr, "config_echo: delay_samples=%d level=%.3f feedback=%.3f filter_coef=%.3f fc0=%.3f\n", delay_samples, level, feedback, filter_coef, S2F(echo.filter_coef));
 }
 
-void dealloc_chorus_delay_lines(uint8_t bus) {
+void dealloc_chorus_delay_lines(uint16_t bus) {
     for(int c = AMY_NCHANS - 1; c >= 0; --c) {
         if (amy_global.bus[bus]->chorus.chorus_delay_lines[c]) free_delay_line(amy_global.bus[bus]->chorus.chorus_delay_lines[c]);
         amy_global.bus[bus]->chorus.chorus_delay_lines[c] = NULL;
@@ -296,10 +328,10 @@ void dealloc_chorus_delay_lines(uint8_t bus) {
     amy_global.bus[bus]->chorus.delay_mod = NULL;
 }
 
-void alloc_chorus_delay_lines(uint8_t bus) {
+void alloc_chorus_delay_lines(uint16_t bus) {
     amy_global.bus[bus]->chorus.delay_mod = (SAMPLE *)malloc_caps(sizeof(SAMPLE) * AMY_BLOCK_SIZE, amy_global.config.ram_caps_delay);
-    bool success = true;
-    for(int c = 0; c < AMY_NCHANS; ++c) {
+    bool success = (amy_global.bus[bus]->chorus.delay_mod != NULL);
+    for(int c = 0; success && c < AMY_NCHANS; ++c) {
         delay_line_t *delay_line = new_delay_line(DELAY_LINE_LEN, DELAY_LINE_LEN / 2, amy_global.config.ram_caps_delay);
         if (delay_line) {
             amy_global.bus[bus]->chorus.chorus_delay_lines[c] = delay_line;
@@ -309,13 +341,17 @@ void alloc_chorus_delay_lines(uint8_t bus) {
         }
     }
     if (!success) {
-        fprintf(stderr, "unable to alloc chorus of %d samples\n", (int)DELAY_LINE_LEN);
+        amy_oom("unable to alloc chorus of %d samples\n", (int)DELAY_LINE_LEN);
         dealloc_chorus_delay_lines(bus);
     }
 }
 
-void config_chorus(uint8_t bus, float level, uint16_t max_delay, float lfo_freq, float depth) {
+void config_chorus(uint16_t bus, float level, uint16_t max_delay, float lfo_freq, float depth) {
     if (AMY_IS_UNSET(level)) level = S2F(amy_global.bus[bus]->chorus.level);
+    // A negative level (possible from the wire) would store as nonzero
+    // without allocating the delay lines, and the render path treats
+    // nonzero level as "chorus is on".
+    if (level < 0) level = 0;
     if (AMY_IS_UNSET(max_delay)) max_delay = amy_global.bus[bus]->chorus.max_delay;
     if (AMY_IS_UNSET(lfo_freq)) lfo_freq = amy_global.bus[bus]->chorus.lfo_freq;
     if (AMY_IS_UNSET(depth)) depth = amy_global.bus[bus]->chorus.depth;
@@ -326,15 +362,23 @@ void config_chorus(uint8_t bus, float level, uint16_t max_delay, float lfo_freq,
         if (amy_global.bus[bus]->chorus.chorus_delay_lines[0] == NULL) {
             alloc_chorus_delay_lines(bus);
         }
+        // On OOM leave the chorus off, as config_reverb does.
+        if (amy_global.bus[bus]->chorus.chorus_delay_lines[0] == NULL) {
+            amy_global.bus[bus]->chorus.level = 0;
+            return;
+        }
         // apply max_delay.
         for (int chan=0; chan<AMY_NCHANS; ++chan) {
             //chorus_delay_lines[chan]->max_delay = max_delay;
             amy_global.bus[bus]->chorus.chorus_delay_lines[chan]->fixed_delay = (int)max_delay / 2;
         }
-        // Configure the LFO osc.
-        ensure_osc_allocd(CHORUS_MOD_SOURCE + bus, NULL);
+        // Configure the LFO osc; on OOM leave the chorus off.
+        if (!ensure_osc_allocd(CHORUS_MOD_SOURCE + bus, NULL)) {
+            amy_global.bus[bus]->chorus.level = 0;
+            return;
+        }
         // if we're turning on for the first time, start the oscillator.
-        if (synth[CHORUS_MOD_SOURCE + bus]->status == SYNTH_OFF) {  //chorus.level == 0) {
+        if (synth[CHORUS_MOD_SOURCE + bus]->role == SYNTH_IS_NORMAL) {  //chorus.level == 0) {
             // Setup chorus oscillator.
             synth[CHORUS_MOD_SOURCE + bus]->logfreq_coefs[COEF_NOTE] = 0;  // Turn off default.
             synth[CHORUS_MOD_SOURCE + bus]->logfreq_coefs[COEF_BEND] = 0;  // Turn off default.
@@ -343,7 +387,7 @@ void config_chorus(uint8_t bus, float level, uint16_t max_delay, float lfo_freq,
             synth[CHORUS_MOD_SOURCE + bus]->wave = TRIANGLE;
             osc_note_on(CHORUS_MOD_SOURCE + bus, lfo_freq);
             // Stop us from doing this again.
-            synth[CHORUS_MOD_SOURCE + bus]->status = SYNTH_IS_MOD_SOURCE;
+            synth[CHORUS_MOD_SOURCE + bus]->role = SYNTH_IS_MOD_SOURCE;
         }
         // apply depth, lfo_freq
         synth[CHORUS_MOD_SOURCE + bus]->amp_coefs[COEF_CONST] = depth;
@@ -355,20 +399,20 @@ void config_chorus(uint8_t bus, float level, uint16_t max_delay, float lfo_freq,
     amy_global.bus[bus]->chorus.depth = depth;
 }
 
-bool alloc_reverb_delay_lines(uint8_t bus) {
+bool alloc_reverb_delay_lines(uint16_t bus) {
     if (amy_global.bus[bus]->reverb.rev == NULL)
         amy_global.bus[bus]->reverb.rev = new_reverb();
     return init_stereo_reverb(amy_global.bus[bus]->reverb.rev);
 }
 
-void dealloc_reverb_delay_lines(uint8_t bus) {
+void dealloc_reverb_delay_lines(uint16_t bus) {
     if (amy_global.bus[bus]->reverb.rev != NULL) {
         deinit_stereo_reverb(amy_global.bus[bus]->reverb.rev);
         delete_reverb(amy_global.bus[bus]->reverb.rev);
     }
 }
 
-void config_reverb(uint8_t bus, float level, float liveness, float damping, float xover_hz) {
+void config_reverb(uint16_t bus, float level, float liveness, float damping, float xover_hz) {
     if (AMY_IS_UNSET(level)) level = S2F(amy_global.bus[bus]->reverb.level);
     if (AMY_IS_UNSET(liveness)) liveness = amy_global.bus[bus]->reverb.liveness;
     if (AMY_IS_UNSET(damping)) damping = amy_global.bus[bus]->reverb.damping;
@@ -376,8 +420,11 @@ void config_reverb(uint8_t bus, float level, float liveness, float damping, floa
     if (level > 0) {
         //printf("config_reverb: level %f liveness %f xover %f damping %f\n",
         //      level, liveness, xover_hz, damping);
-        if (amy_global.bus[bus]->reverb.level == 0) {
-            if (!alloc_reverb_delay_lines(bus)) {
+        // Gate allocation on the reverb state itself, not on level == 0: a
+        // negative wire level is stored below without allocating, which used
+        // to let a later positive level skip the alloc and configure NULL.
+        if (amy_global.bus[bus]->reverb.rev == NULL) {
+            if (!alloc_reverb_delay_lines(bus) || amy_global.bus[bus]->reverb.rev == NULL) {
                 amy_global.bus[bus]->reverb.level = 0;
                 return;
             }
@@ -428,14 +475,14 @@ int peek_stack(const char *tag)  { return 0; }
 #endif
 
 
-void config_eq(uint8_t bus, SAMPLE eq_l, SAMPLE eq_m, SAMPLE eq_h) {
+void config_eq(uint16_t bus, SAMPLE eq_l, SAMPLE eq_m, SAMPLE eq_h) {
     amy_global.bus[bus]->eq.eq[0] = eq_l;
     amy_global.bus[bus]->eq.eq[1] = eq_m;
     amy_global.bus[bus]->eq.eq[2] = eq_h;
 }
 
 
-void bus_reset(uint8_t bus) {
+void bus_reset(uint16_t bus) {
     config_eq(bus, F2S(1.0f), F2S(1.0f), F2S(1.0f));
     filters_init(bus);
     reset_parametric(bus);
@@ -447,15 +494,20 @@ void bus_reset(uint8_t bus) {
 
 
 void buses_reset() {
-    for (int i = 0; i < AMY_NUM_BUSES; ++i) {
+    for (int i = 0; i < amy_global.config.max_buses; ++i) {
         bus_reset(i);
     }
 }
 
-
 int8_t global_init(amy_config_t c) {
     peek_stack("init");
     amy_global.config = c;
+    // Everything below -- and every bus-indexed table in the rest of AMY --
+    // reads max_buses back out of the config, so settle it first.  A caller that
+    // built its config by hand rather than from amy_default_config() arrives
+    // here with a zero, which would otherwise mean no buses at all.
+    if (amy_global.config.max_buses == 0)
+        amy_global.config.max_buses = AMY_DEFAULT_NUM_BUSES;
     // Precompute implications of overload thresholds.
     //amy_global.overload_threshold_us = (uint32_t)(c.overload_threshold * ((float)AMY_BLOCK_US));
     amy_set_render_load_threshold(c.overload_threshold);
@@ -464,11 +516,23 @@ int8_t global_init(amy_config_t c) {
     amy_global.i2s_is_in_background = 0;
     amy_global.delta_queue = NULL;
     amy_global.delta_qsize = 0;
-    for (int bus = 0; bus < AMY_NUM_BUSES; ++bus)
+    // The per-bus tables are sized from max_buses; nothing about a bus is a
+    // fixed-width array any more.
+    amy_global.volume = (float *)malloc_caps(sizeof(float) * amy_global.config.max_buses,
+                                             amy_global.config.ram_caps_synth);
+    amy_global.volume_scale = (SAMPLE *)malloc_caps(sizeof(SAMPLE) * amy_global.config.max_buses,
+                                                    amy_global.config.ram_caps_synth);
+    amy_global.bus = (bus_state_t **)malloc_caps(sizeof(bus_state_t *) * amy_global.config.max_buses,
+                                                 amy_global.config.ram_caps_synth);
+    if (amy_global.volume == NULL || amy_global.volume_scale == NULL || amy_global.bus == NULL) {
+        fprintf(stderr, "unable to alloc %d buses\n", amy_global.config.max_buses);
+        return -1;
+    }
+    for (int bus = 0; bus < amy_global.config.max_buses; ++bus)
         amy_global.volume[bus] = 1.0f;
     amy_global.pitch_bend = 0;
     amy_global.latency_ms = 0;
-    amy_global.tempo = 108.0; 
+    amy_global.tempo = 108.0;
     amy_global.pitch_bend = 0;
     amy_global.transfer_flag = AMY_TRANSFER_TYPE_NONE;
     amy_global.transfer_storage = NULL;
@@ -481,19 +545,25 @@ int8_t global_init(amy_config_t c) {
     amy_global.hpf_state = 0;
     amy_global.render_us = 0;
     amy_global.overload_count = 0;
+    amy_global.oom_count = 0;
     amy_global.sequencer_tick_count = 0;
     amy_global.next_amy_tick_us = 0;
     amy_global.us_per_tick = 0;
-    amy_global.sequence_entry_ll_start = NULL;
+    amy_global.reset_timebase_pending = 0;
 
-    struct bus_state *bus_configs = malloc_caps(sizeof(struct bus_state) * AMY_NUM_BUSES,
+    struct bus_state *bus_configs = malloc_caps(sizeof(struct bus_state) * amy_global.config.max_buses,
                                                 amy_global.config.ram_caps_synth);
-    bzero(bus_configs, sizeof(struct bus_state) * AMY_NUM_BUSES);
-    for (int i = 0; i < AMY_NUM_BUSES; ++i) {
+    if (bus_configs == NULL) {
+        fprintf(stderr, "unable to alloc %d bus states\n", amy_global.config.max_buses);
+        return -1;
+    }
+    bzero(bus_configs, sizeof(struct bus_state) * amy_global.config.max_buses);
+    for (int i = 0; i < amy_global.config.max_buses; ++i) {
         amy_global.bus[i] = bus_configs;
         ++bus_configs;
     }
     buses_reset();
+    midi_mappings_init();  // Make sure arrays are clear.
     
     amy_init_lock();
 
@@ -501,8 +571,14 @@ int8_t global_init(amy_config_t c) {
 }
 
 void global_deinit(void) {
-    for (int bus = 0; bus < AMY_NUM_BUSES; ++bus)  filters_deinit(bus);
-    free(amy_global.bus[0]);
+    for (int bus = 0; bus < amy_global.config.max_buses; ++bus)  filters_deinit(bus);
+    free(amy_global.bus[0]);  // One allocation for every bus_state; bus[i] points into it.
+    free(amy_global.bus);
+    free(amy_global.volume_scale);
+    free(amy_global.volume);
+    amy_global.bus = NULL;
+    amy_global.volume_scale = NULL;
+    amy_global.volume = NULL;
 }
 
 // Convert to and from the log-frequency scale.
@@ -511,7 +587,9 @@ float logfreq_of_freq(float freq) {
     // logfreq is defined as log_2(freq / 8.18 Hz)
     //if (freq==0) return ZERO_HZ_LOG_VAL;
     // Actually, special-case zero to mean middle C, for convenience.
-    if (freq==0) return 0;  // i.e. == logfreq_of_freq(ZERO_LOGFREQ_IN_HZ).
+    // Negative frequencies (possible from wire messages) get the same
+    // treatment; log2 of them is undefined.
+    if (freq<=0) return 0;  // i.e. == logfreq_of_freq(ZERO_LOGFREQ_IN_HZ).
     //return log2f(freq / ZERO_LOGFREQ_IN_HZ);
     return 2.0f + S2F(log2_lut(F2S(freq / (4 * ZERO_LOGFREQ_IN_HZ))));
 }
@@ -526,12 +604,13 @@ float freq_of_logfreq(float logfreq) {
 float freq_for_midi_note(float midi_note) {
     //return 440.0f*powf(2.f, (midi_note - 69.0f) / 12.0f);
     //return 440.0f * exp2f((midi_note - 69.0f) / 12.0f);
-    return 440.0f * S2F(exp2_lut(F2S((midi_note - 69.0f) / 12.0f)));
+    return 440.0f * S2F(exp2_lut(F2S((midi_note - 69.0f) * 0.083333333333f)));
 }
 
 float logfreq_for_midi_note(float midi_note) {
     // TODO: Precompensate for EPS_FOR_LOG
-    return (midi_note - ZERO_MIDI_NOTE) / 12.0f;
+    //return (midi_note - ZERO_MIDI_NOTE) / 12.0f;
+    return (midi_note - ZERO_MIDI_NOTE) * 0.083333333333f;
 }
 
 float midi_note_for_logfreq(float logfreq) {
@@ -550,9 +629,21 @@ void add_delta_to_queue(struct delta *d, struct delta **queue) {
 
     struct delta *new_d = delta_get(d);
 
-    // insert it into the sorted list for fast playback
+    // Pool couldn't grow: undo the qsize bump and drop the delta.
+    if (new_d == NULL) {
+        if (queue == &amy_global.delta_queue && amy_global.delta_qsize > 0)
+            amy_global.delta_qsize--;
+        amy_release_lock();
+        AMY_PROFILE_STOP(ADD_DELTA_TO_QUEUE)
+        return;
+    }
+
+    // insert it into the sorted list for fast playback.
+    // Wrap-relative: at the 49.7-day rollover a note_off scheduled a few ms out
+    // has a tiny d->time while its own note_on is still near 2^32, so a plain
+    // `>=` sorted the release ahead of the attack and the note droned forever.
     struct delta **pptr = queue;
-    while(*pptr && d->time >= (*pptr)->time)
+    while(*pptr && AMY_TIME_GEQ(d->time, (*pptr)->time))
         pptr = &(*pptr)->next;
     new_d->next = *pptr;
     *pptr = new_d;
@@ -562,9 +653,18 @@ void add_delta_to_queue(struct delta *d, struct delta **queue) {
 
 }
 
+// The smallest amplitude this maps rather than treating as silence. log2_lut
+// requires a strictly positive argument -- it normalizes by shifting, so zero
+// shifts to zero forever -- and `lin == 0` did not cover everything that
+// reaches it as zero or worse: a negative amplitude, a NaN, or (in fixed-point
+// builds, 23 fractional bits) any amplitude that underflows the conversion.
+// This is 60 dB below the quietest amplitude the mapping describes, so
+// nothing audible changes. Written as !(lin > MIN) so NaN takes the guard too.
+#define MAP_60DB_MIN_LIN 1e-6f
+
 float map_60dB_to_01f(float lin) {
     // Map .001 to 0, 1 to 1 logarithmically.
-    if (lin == 0) return -10.0f;
+    if (!(lin > MAP_60DB_MIN_LIN)) return -10.0f;
     // Use AMY's fast log2 LUT instead of libm log2f (called per-osc per-block).
     float result = 1.0f + 0.10034333188799373f * S2F(log2_lut(F2S(lin)));  // 0.100343 = 1 / (3 * log2(10))
     return result;
@@ -573,13 +673,14 @@ float map_60dB_to_01f(float lin) {
 float map_01_to_60dBf(float log) {
     // Inverse of map_60dB_to_01f - Map (0, 1) to (.001, 1) exponentially
     if (log <= -10.0f) return 0;
-    float result = S2F(exp2_lut(F2S((log - 1.0f) / 0.10034333188799373f)));
+    //float result = S2F(exp2_lut(F2S((log - 1.0f) / 0.10034333188799373f)));
+    float result = S2F(exp2_lut(F2S((log - 1.0f) * 9.9657842846621f)));
     return result;
 }
 
 #define EVENT_TO_DELTA_F(FIELD, FLAG) if(AMY_IS_SET(e->FIELD)) { d.param=FLAG; d.data.f = e->FIELD; add_delta_to_queue(&d, queue); }
 #define EVENT_TO_DELTA_I(FIELD, FLAG) if(AMY_IS_SET(e->FIELD)) { d.param=FLAG; d.data.i = e->FIELD; add_delta_to_queue(&d, queue); }
-#define EVENT_TO_DELTA_WITH_BASEOSC(FIELD, FLAG)    if(AMY_IS_SET(e->FIELD)) { d.param=FLAG; d.data.i = e->FIELD + base_osc; if (FLAG != RESET_OSC && d.data.i < (uint32_t)AMY_OSCS + AMY_NUM_BUSES) ensure_osc_allocd(d.data.i, NULL); add_delta_to_queue(&d, queue);}
+#define EVENT_TO_DELTA_WITH_BASEOSC(FIELD, FLAG)    if(AMY_IS_SET(e->FIELD)) { d.param=FLAG; d.data.i = e->FIELD + base_osc; if (FLAG != RESET_OSC && queue == &amy_global.delta_queue && d.data.i < (uint32_t)AMY_OSCS + amy_global.config.max_buses) ensure_osc_allocd(d.data.i, NULL); add_delta_to_queue(&d, queue);}
 #define EVENT_TO_DELTA_LOG(FIELD, FLAG)             if(AMY_IS_SET(e->FIELD)) { d.param=FLAG; d.data.f = log2f(e->FIELD); add_delta_to_queue(&d, queue);}
 #define EVENT_TO_DELTA_COEFS(FIELD, FLAG)  \
     for (int i = 0; i < NUM_COMBO_COEFS; ++i) \
@@ -599,42 +700,61 @@ float map_01_to_60dBf(float log) {
 #define EVENT_TO_DELTA_FREQ_COEFS(FIELD, FLAG) \
     EVENT_TO_DELTA_COEFS_COEF0_SPECIAL(FIELD, FLAG, logfreq_of_freq)
 
+static void flush_due_deltas();  // definition next to amy_execute_deltas()
+
 // Add a API facing event, convert into delta directly
 void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **queue) {
+    // fprintf(stderr, "time %.3f amy_event_to_deltas: base_osc %d\n", amy_global.time, base_osc);
+    // fprintf_event_stderr(e);
     AMY_PROFILE_START(AMY_ADD_DELTA)
     struct delta d;
     peek_stack("event_to_deltas");
     // Synth defaults if not set, these are required for the delta struct
     d.time = e->time;
-    d.osc = e->osc;
-    if(AMY_IS_UNSET(e->osc)) { d.osc = 0; } 
     if(AMY_IS_UNSET(e->time)) { d.time = 0; } 
 
     // If this is a bus-directed event, use d->osc to store the bus number instead.
-    bool bus_directed_command = event_is_bus_directed(e);
-    if (bus_directed_command) {
-        if (AMY_IS_SET(e->osc))  {
-            fprintf(stderr, "** osc %d specific for bus-directed command, ignoring\n", e->osc);  // Can't at this moment be more specific about which command.
-            fprintf_event_stderr(e);
-        }
+    if (event_addresses_bus(e)) {
         // Store the target bus in d.osc.  Either bus is specified, or synth is specified and has a bus, or default.
-        d.osc = AMY_IS_SET(e->bus) ? e->bus :
-            ((AMY_IS_SET(e->synth) && instrument_get_bus(e->synth) >= 0) ? instrument_get_bus(e->synth) : AMY_DEFAULT_BUS);
-        bus_directed_command = true;
-        if (d.osc > amy_global.highest_bus) amy_global.highest_bus = d.osc;
-    } else {
-        // d.osc refers to an osc
-        // First, adapt the osc in this event with base_osc offsets for voices
-        d.osc += base_osc;
-        // Ensure this osc has its synthinfo allocated.
-        ensure_osc_allocd(d.osc, NULL);
+        uint16_t bus = amy_validate_bus(AMY_IS_SET(e->bus) ? e->bus :
+            ((AMY_IS_SET(e->synth) && instrument_get_bus(e->synth) >= 0) ? instrument_get_bus(e->synth) : AMY_DEFAULT_BUS));
+        if (bus > amy_global.highest_bus) amy_global.highest_bus = bus;
+        // Issue deltas for the bus-directed commands.
+        d.osc = bus;
+        EVENT_TO_DELTA_F(volume, VOLUME)
+        EVENT_TO_DELTA_F(eq_l, EQ_L)
+        EVENT_TO_DELTA_F(eq_m, EQ_M)
+        EVENT_TO_DELTA_F(eq_h, EQ_H)
+        EVENT_TO_DELTA_F(echo_max_delay_ms, ECHO_MAX_DELAY_MS)  // set MAX_DELAY first
+        EVENT_TO_DELTA_F(echo_level, ECHO_LEVEL)
+        EVENT_TO_DELTA_F(echo_delay_ms, ECHO_DELAY_MS)
+        EVENT_TO_DELTA_F(echo_feedback, ECHO_FEEDBACK)
+        EVENT_TO_DELTA_F(echo_filter_coef, ECHO_FILTER_COEF)
+        EVENT_TO_DELTA_F(chorus_max_delay, CHORUS_MAX_DELAY)   // set MAX_DELAY first
+        EVENT_TO_DELTA_F(chorus_level, CHORUS_LEVEL)
+        EVENT_TO_DELTA_F(chorus_lfo_freq, CHORUS_LFO_FREQ)
+        EVENT_TO_DELTA_F(chorus_depth, CHORUS_DEPTH)
+        EVENT_TO_DELTA_F(reverb_level, REVERB_LEVEL)
+        EVENT_TO_DELTA_F(reverb_liveness, REVERB_LIVENESS)
+        EVENT_TO_DELTA_F(reverb_damping, REVERB_DAMPING)
+        EVENT_TO_DELTA_F(reverb_xover_hz, REVERB_XOVER_HZ)
     }
+    // Hereafter, d.osc refers to an osc
+    d.osc = e->osc;
+    if(AMY_IS_UNSET(e->osc)) { d.osc = 0; }
+    // First, adapt the osc in this event with base_osc offsets for voices
+    d.osc += base_osc;
+    // The osc's synthinfo is allocated below, once the destination queue is
+    // known - see there.
 
     // Voices / patches gets set up here 
-    // you must set both voices & load_patch together to load a patch 
-    if (AMY_IS_SET(e->voices[0]) || AMY_IS_SET(e->synth)) {
+    // you must set both synth & load_patch together to load a patch 
+    if (AMY_IS_SET(e->synth)) {
         if (AMY_IS_SET(e->patch_number) || AMY_IS_SET(e->num_voices) || AMY_IS_SET(e->oscs_per_voice)) {
-            amy_execute_deltas();
+            // Settle pending deltas without running the sequencer tick
+            // service - this can execute on any sending thread (see
+            // flush_due_deltas).
+            flush_due_deltas();
             patches_load_patch(e);
         }
         // Execute any other commands in this event.
@@ -651,21 +771,36 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
             // The patch number was invalid (e.g., not in user range 1024+), so we got no queue, so ignore the event.
             fprintf(stderr, "event ignored\n");
             goto end;
-        }            
+        }
+    }
+
+    // Ensure the addressed osc's synthinfo only when these deltas are headed
+    // for live execution. Describing an osc - into a stored patch's delta
+    // list or a voice snapshot, both built base-osc-relative - must not
+    // allocate low osc numbers nothing is playing; play_delta ensures at
+    // execution for everything that actually plays.
+    if (queue == &amy_global.delta_queue) {
+        ensure_osc_allocd(d.osc, NULL);
     }
 
     // Everything else only added to queue if set
-    int bus = 0;
-    if (!bus_directed_command) {
-        EVENT_TO_DELTA_I(bus, BUS)
-        if (AMY_IS_SET(e->bus)) {
-            bus = e->bus;
-            if(bus > amy_global.highest_bus)
-                amy_global.highest_bus = e->bus;
-        }
+
+    // Only propagate bus if osc was explicit, not for default-zero-osc.
+    if (AMY_IS_SET(e->bus) && AMY_IS_SET(e->osc)) {
+        uint16_t bus = amy_validate_bus(e->bus);
+        d.param = BUS; d.data.i = bus; add_delta_to_queue(&d, queue);
+        if(bus > amy_global.highest_bus)
+            amy_global.highest_bus = bus;
     }
     EVENT_TO_DELTA_I(wave, WAVE)
+    // PRESET before MODE, and it matters: pcm_loop_config_allowed() refuses
+    // whichever of the pair arrives second and makes the configuration
+    // impossible. A single message asking for a file-backed preset AND a
+    // PCM_LOOP* mode is the common way to hit that, and refusing the *mode*
+    // leaves something useful (the sample, playing once) where refusing the
+    // preset would leave a loop mode pointing at nothing.
     EVENT_TO_DELTA_I(preset, PRESET)
+    EVENT_TO_DELTA_I(mode, MODE)
     EVENT_TO_DELTA_F(midi_note, MIDI_NOTE)
     EVENT_TO_DELTA_COEFS(amp_coefs, AMP)
     EVENT_TO_DELTA_FREQ_COEFS(freq_coefs, FREQ)
@@ -682,31 +817,16 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **q
     EVENT_TO_DELTA_I(portamento_ms, PORTAMENTO)
     EVENT_TO_DELTA_WITH_BASEOSC(chained_osc, CHAINED_OSC)
     EVENT_TO_DELTA_WITH_BASEOSC(reset_osc, RESET_OSC)
-    EVENT_TO_DELTA_WITH_BASEOSC(mod_source, MOD_SOURCE)
+    // One delta per mod source slot, and only for the slots this event actually
+    // names, so `mod_source=3` still means "slot 0 = osc 3, leave slot 1 alone".
+    for (int i = 0; i < NUM_MOD_SOURCES; ++i) {
+        EVENT_TO_DELTA_WITH_BASEOSC(mod_source[i], MOD_SOURCE_START + i)
+    }
     EVENT_TO_DELTA_I(note_source_channel, NOTE_SOURCE_CHANNEL)
     EVENT_TO_DELTA_I(filter_type, FILTER_TYPE)
     EVENT_TO_DELTA_I(algorithm, ALGORITHM)
-    EVENT_TO_DELTA_F(eq_l, EQ_L)
-    EVENT_TO_DELTA_F(eq_m, EQ_M)
-    EVENT_TO_DELTA_F(eq_h, EQ_H)
-    EVENT_TO_DELTA_F(echo_max_delay_ms, ECHO_MAX_DELAY_MS)  // set MAX_DELAY first
-    EVENT_TO_DELTA_F(echo_level, ECHO_LEVEL)
-    EVENT_TO_DELTA_F(echo_delay_ms, ECHO_DELAY_MS)
-    EVENT_TO_DELTA_F(echo_feedback, ECHO_FEEDBACK)
-    EVENT_TO_DELTA_F(echo_filter_coef, ECHO_FILTER_COEF)
-    EVENT_TO_DELTA_F(chorus_max_delay, CHORUS_MAX_DELAY)   // set MAX_DELAY first
-    EVENT_TO_DELTA_F(chorus_level, CHORUS_LEVEL)
-    EVENT_TO_DELTA_F(chorus_lfo_freq, CHORUS_LFO_FREQ)
-    EVENT_TO_DELTA_F(chorus_depth, CHORUS_DEPTH)
-    EVENT_TO_DELTA_F(reverb_level, REVERB_LEVEL)
-    EVENT_TO_DELTA_F(reverb_liveness, REVERB_LIVENESS)
-    EVENT_TO_DELTA_F(reverb_damping, REVERB_DAMPING)
-    EVENT_TO_DELTA_F(reverb_xover_hz, REVERB_XOVER_HZ)
     EVENT_TO_DELTA_I(eg_type[0], EG0_TYPE)
     EVENT_TO_DELTA_I(eg_type[1], EG1_TYPE)
-
-    for (int b = bus; b < AMY_NUM_BUSES; ++b)
-        EVENT_TO_DELTA_F(volume[b], VOLUME_BASE + b)  // Even though the actual volume param being set depends on bus, we set the relative DELTA here, and add bus in play_delta().
 
     bool algo_ops_set = false;
     for (int i = 0; i < MAX_ALGO_OPS; ++i) {
@@ -797,6 +917,7 @@ void reset_modosc(struct mod_synthinfo *pmsynth) {
         pmsynth->pan = 0.5f;
         pmsynth->feedback = F2S(0); //.996; todo ks feedback is v different from fm feedback
         pmsynth->resonance = 0.7f;
+        pmsynth->state = 0;
     }
 }
 
@@ -805,8 +926,9 @@ void reset_osc_params(struct synthinfo *psynth) {
     // Event-derived config
     psynth->bus = AMY_DEFAULT_BUS;
     psynth->wave = SINE;
+    psynth->mode = MODE_NONE;
     AMY_UNSET(psynth->preset);
-    AMY_UNSET(psynth->note_source_channel);
+    AMY_UNSET(psynth->s_note_source_channel);
     AMY_UNSET(psynth->midi_note);
     psynth->velocity = 0;
     for (int j = 0; j < NUM_COMBO_COEFS; ++j)  psynth->amp_coefs[j] = 0;
@@ -828,7 +950,7 @@ void reset_osc_params(struct synthinfo *psynth) {
     psynth->resonance = 0.7f;
     psynth->filter_type = FILTER_NONE;
     AMY_UNSET(psynth->chained_osc);
-    AMY_UNSET(psynth->mod_source);
+    for(uint8_t j=0;j<NUM_MOD_SOURCES;j++) AMY_UNSET(psynth->mod_source[j]);
     psynth->algorithm = 0;
     for(uint8_t j=0;j<MAX_ALGO_OPS;j++) AMY_UNSET(psynth->algo_source[j]);
     for(uint8_t j=0;j<MAX_BREAKPOINT_SETS;j++) {
@@ -851,10 +973,9 @@ void reset_osc_params(struct synthinfo *psynth) {
 
 void reset_osc_state(struct synthinfo *psynth) {
     // osc state are the internal values that keep track of the osc evolution in time.
+    psynth->role = SYNTH_IS_NORMAL;
     psynth->status = SYNTH_OFF;
     psynth->phase = F2P(0);
-    psynth->step = 0;
-    psynth->substep = 0;
     AMY_UNSET(psynth->render_clock);
     AMY_UNSET(psynth->note_on_clock);
     psynth->note_off_clock = 0;  // Used to check that last event seen by note was off.
@@ -886,11 +1007,11 @@ void amy_reset_oscs() {
     // Put the noise generator into a known state.
     srand48(517730);
     // We reset oscs by freeing them.
-    // Include per-bus chorus oscs (osc=AMY_OSCS..AMY_OSCS+AMY_NUM_BUSES)
-    for(uint16_t i=0;i<AMY_OSCS + AMY_NUM_BUSES;i++) free_osc(i);
-    //for(uint16_t i=0;i<AMY_OSCS + AMY_NUM_BUSES;i++) reset_osc(i);
+    // Include per-bus chorus oscs (osc=AMY_OSCS..AMY_OSCS+amy_global.config.max_buses)
+    for(uint16_t i=0;i<AMY_OSCS + amy_global.config.max_buses;i++) free_osc(i);
+    //for(uint16_t i=0;i<AMY_OSCS + amy_global.config.max_buses;i++) reset_osc(i);
     // also reset filters and volume
-    for (int bus = 0; bus < AMY_NUM_BUSES; ++bus)
+    for (int bus = 0; bus < amy_global.config.max_buses; ++bus)
         amy_global.volume[bus] = 1.0f;
     my_srand48(517730);
     buses_reset();
@@ -903,6 +1024,7 @@ void amy_reset_oscs() {
     // Reset midi_mappings.
     midi_mappings_deinit();
     midi_mappings_init();
+    midi_active_channels_reset();
     cv_trigger_deinit();
     cv_trigger_init();
     cv_from_osc_deinit();
@@ -926,7 +1048,14 @@ void alloc_osc(int osc, uint8_t *max_num_breakpoints) {
     for (int i=0; i < MAX_BREAKPOINT_SETS; ++i)  total_num_breakpoints += max_num_breakpoints[i];
     uint8_t *ptr = malloc_caps(sizeof(struct synthinfo) + sizeof(struct mod_synthinfo)
                                + total_num_breakpoints * (sizeof(float) + sizeof(uint32_t)),
-                               amy_global.config.ram_caps_events);
+                               amy_global.config.ram_caps_oscs);
+    // On OOM leave the osc NULL; the voice goes silent instead of crashing.
+    if (ptr == NULL) {
+        amy_oom("alloc_osc: out of memory allocating osc %d\n", osc);
+        synth[osc] = NULL;
+        msynth[osc] = NULL;
+        return;
+    }
     synth[osc] = (struct synthinfo *)ptr;
     msynth[osc] = (struct mod_synthinfo *)(ptr + sizeof(struct synthinfo));
     // Point to the breakpoint sets.
@@ -951,13 +1080,29 @@ void free_osc(int osc) {
     msynth[osc] = NULL;
 }
 
-void ensure_osc_allocd(int osc, uint8_t *max_num_breakpoints) {
-    if (synth[osc] == NULL) alloc_osc(osc, max_num_breakpoints);
-    else if (max_num_breakpoints) {
+// Ensure synth[osc] exists with at least the requested breakpoint capacity.
+// Returns false on OOM: the osc is still NULL, or (for a grow) keeps its old,
+// smaller vectors.
+bool ensure_osc_allocd(int osc, uint8_t *max_num_breakpoints) {
+    // The osc number can come from wire data (directly, or shifted by
+    // base_osc/algo_source arithmetic), so bounds-check before indexing
+    // synth[], which has AMY_OSCS + max_buses (chorus mod oscs) entries.
+    // Callers treat false the same as OOM: they drop the delta.
+    if (osc < 0 || osc >= (int)(AMY_OSCS + amy_global.config.max_buses)) {
+        fprintf(stderr, "osc %d out of range 0..%d, dropped\n",
+                osc, (int)(AMY_OSCS + amy_global.config.max_buses) - 1);
+        return false;
+    }
+    if (synth[osc] == NULL) {
+        alloc_osc(osc, max_num_breakpoints);
+        return synth[osc] != NULL;
+    }
+    if (max_num_breakpoints) {
         bool realloc_needed = false;
         uint8_t new_max_num_breakpoints[MAX_BREAKPOINT_SETS];
         for (int i = 0; i < MAX_BREAKPOINT_SETS; ++i) {
-            new_max_num_breakpoints[i] = DEFAULT_NUM_BREAKPOINTS;
+            // Never shrink a set; the copy below has to fit its old contents.
+            new_max_num_breakpoints[i] = synth[osc]->max_num_breakpoints[i];
             if (synth[osc]->max_num_breakpoints[i] < max_num_breakpoints[i]) {
                 realloc_needed = true;
                 // Increase num_breakpoints in blocks of DEFAULT_NUM_BREAKPOINTS.
@@ -967,52 +1112,42 @@ void ensure_osc_allocd(int osc, uint8_t *max_num_breakpoints) {
         }
         if (realloc_needed) {
             //fprintf(stderr, "realloc for osc %d (breakpoints %d, %d -> %d, %d (wave=%d)\n", osc, synth[osc]->max_num_breakpoints[0], synth[osc]->max_num_breakpoints[1], max_num_breakpoints[0], max_num_breakpoints[1], synth[osc]->wave);
-            // Save the current values in the structure.
-            struct synthinfo saved_values = *synth[osc];
-            int32_t breakpoint_times[MAX_BREAKPOINT_SETS][MAX_BREAKPOINTS];
-            float breakpoint_values[MAX_BREAKPOINT_SETS][MAX_BREAKPOINTS];
-            int num_old_breakpoints[MAX_BREAKPOINT_SETS];
-            for (int i = 0; i < MAX_BREAKPOINT_SETS; ++i) {
-                num_old_breakpoints[i] = synth[osc]->max_num_breakpoints[i];
-                for (int j = 0; j < num_old_breakpoints[i]; ++j) {
-                    breakpoint_times[i][j] = synth[osc]->breakpoint_times[i][j];
-                    breakpoint_values[i][j] = synth[osc]->breakpoint_values[i][j];
-                }
-            }
-            // Reallocate the structure.
-            free_osc(osc);
+            // Allocate the replacement before freeing the old block, so OOM
+            // leaves the osc's state intact.
+            struct synthinfo *old_synth = synth[osc];
+            struct mod_synthinfo *old_msynth = msynth[osc];
+            synth[osc] = NULL;
             alloc_osc(osc, new_max_num_breakpoints);
-            // Save the pointers to the newly-alloc'd vectors.
-            uint32_t *saved_breakpoint_times[MAX_BREAKPOINT_SETS];
-            float *saved_breakpoint_values[MAX_BREAKPOINT_SETS];
-            int saved_max_num_breakpoints[MAX_BREAKPOINT_SETS];
-            for (int i = 0; i < MAX_BREAKPOINT_SETS; ++i) {
-                saved_breakpoint_times[i] = synth[osc]->breakpoint_times[i];
-                saved_breakpoint_values[i]= synth[osc]->breakpoint_values[i];
-                saved_max_num_breakpoints[i] = synth[osc]->max_num_breakpoints[i];
+            if (synth[osc] == NULL) {
+                synth[osc] = old_synth;
+                msynth[osc] = old_msynth;
+                return false;
             }
-            // Copy all the values from the previous alloc.
-            (*synth[osc]) = saved_values;
-            // Restore the new breakpoint vectors.
+            // Copy the old state over, keeping the new (larger) vectors.
+            struct synthinfo *new_synth = synth[osc];
+            struct synthinfo fresh = *new_synth;  // new vectors and counts
+            *new_synth = *old_synth;
             for (int i = 0; i < MAX_BREAKPOINT_SETS; ++i) {
-                synth[osc]->breakpoint_times[i] = saved_breakpoint_times[i];
-                synth[osc]->breakpoint_values[i] = saved_breakpoint_values[i];
-                synth[osc]->max_num_breakpoints[i] = saved_max_num_breakpoints[i];
-            }
-            // And, to be conservative, the breakpoint values themselves.
-            for (int i = 0; i < MAX_BREAKPOINT_SETS; ++i) {
-                for (int j = 0; j < num_old_breakpoints[i]; ++j) {
-                    synth[osc]->breakpoint_times[i][j] = breakpoint_times[i][j];
-                    synth[osc]->breakpoint_values[i][j] = breakpoint_values[i][j];
+                new_synth->breakpoint_times[i] = fresh.breakpoint_times[i];
+                new_synth->breakpoint_values[i] = fresh.breakpoint_values[i];
+                new_synth->max_num_breakpoints[i] = fresh.max_num_breakpoints[i];
+                int num_old_breakpoints = old_synth->max_num_breakpoints[i];
+                for (int j = 0; j < num_old_breakpoints; ++j) {
+                    new_synth->breakpoint_times[i][j] = old_synth->breakpoint_times[i][j];
+                    new_synth->breakpoint_values[i][j] = old_synth->breakpoint_values[i][j];
                 }
                 // And clear the ones beyond
-                for (int j = num_old_breakpoints[i]; j < synth[osc]->max_num_breakpoints[i]; ++j) {
-                    AMY_UNSET(synth[osc]->breakpoint_times[i][j]);
-                    AMY_UNSET(synth[osc]->breakpoint_values[i][j]);
+                for (int j = num_old_breakpoints; j < new_synth->max_num_breakpoints[i]; ++j) {
+                    AMY_UNSET(new_synth->breakpoint_times[i][j]);
+                    AMY_UNSET(new_synth->breakpoint_values[i][j]);
                 }
             }
+            free(old_synth);
         }
+        for (int i = 0; i < MAX_BREAKPOINT_SETS; ++i)
+            if (synth[osc]->max_num_breakpoints[i] < max_num_breakpoints[i]) return false;
     }
+    return true;
 }
 
 
@@ -1033,9 +1168,9 @@ int8_t oscs_init() {
     if(pcm_samples)  pcm_init();
     if(AMY_HAS_CUSTOM)  custom_init();
     // synth and msynth are now pointers to arrays of pointers to dynamically-allocated synth structures.
-    synth = (struct synthinfo **) malloc_caps(sizeof(struct synthinfo *) * (AMY_OSCS + AMY_NUM_BUSES), amy_global.config.ram_caps_synth);
-    bzero(synth, sizeof(struct synthinfo *) * (AMY_OSCS + AMY_NUM_BUSES));
-    msynth = (struct mod_synthinfo **) malloc_caps(sizeof(struct mod_synthinfo *) * (AMY_OSCS + AMY_NUM_BUSES), amy_global.config.ram_caps_synth);
+    synth = (struct synthinfo **) malloc_caps(sizeof(struct synthinfo *) * (AMY_OSCS + amy_global.config.max_buses), amy_global.config.ram_caps_synth);
+    bzero(synth, sizeof(struct synthinfo *) * (AMY_OSCS + amy_global.config.max_buses));
+    msynth = (struct mod_synthinfo **) malloc_caps(sizeof(struct mod_synthinfo *) * (AMY_OSCS + amy_global.config.max_buses), amy_global.config.ram_caps_synth);
     output_block_0 = (output_sample_type *) malloc_caps(sizeof(output_sample_type) * AMY_BLOCK_SIZE * AMY_NCHANS, amy_global.config.ram_caps_block);
     output_block_1 = (output_sample_type *) malloc_caps(sizeof(output_sample_type) * AMY_BLOCK_SIZE * AMY_NCHANS, amy_global.config.ram_caps_block);
     output_block = output_block_0;
@@ -1053,7 +1188,13 @@ int8_t oscs_init() {
 
     // clear out both as local mode won't use fbl[1] 
     for(uint16_t core=0;core<AMY_CORES;++core) {
-        for (int bus = 0; bus < AMY_NUM_BUSES; ++bus) {
+        fbl[core] = (SAMPLE**)malloc_caps(sizeof(SAMPLE*) * amy_global.config.max_buses, amy_global.config.ram_caps_fbl);
+        per_osc_fb[core] = (SAMPLE**)malloc_caps(sizeof(SAMPLE*) * amy_global.config.max_buses, amy_global.config.ram_caps_fbl);
+        if (fbl[core] == NULL || per_osc_fb[core] == NULL) {
+            fprintf(stderr, "unable to alloc mix buffers for %d buses\n", amy_global.config.max_buses);
+            return -1;
+        }
+        for (int bus = 0; bus < amy_global.config.max_buses; ++bus) {
             per_osc_fb[core][bus] = (SAMPLE*)malloc_caps(sizeof(SAMPLE) * AMY_BLOCK_SIZE, amy_global.config.ram_caps_fbl);
             fbl[core][bus] = (SAMPLE*)malloc_caps(sizeof(SAMPLE) * AMY_BLOCK_SIZE * AMY_NCHANS, amy_global.config.ram_caps_fbl);
             bzero(fbl[core][bus], sizeof(SAMPLE) * AMY_BLOCK_SIZE * AMY_NCHANS);
@@ -1081,9 +1222,9 @@ void fprint_combo_coefs(char *name, float *coefs) {
 
 void print_osc_debug(uint16_t i /* osc */, bool show_eg) {
     if (synth[i] == NULL)  {fprintf(stderr, "osc %" PRIu16 " not defined\n", i); return; }
-    fprintf(stderr,"osc %" PRIu16 ": status %" PRIu8 " wave %" PRIu16 " mod_source %" PRIu16 " velocity %f logratio %f feedback %f filtype %" PRIu8 " resonance %f portamento_alpha %f step %f chained %" PRIu16 " algo %" PRIu8 " algo_source %" PRIu16 ",%" PRIu16 ",%" PRIu16 ",%" PRIu16 ",%" PRIu16 ",%" PRIu16 "  \n",
-            i, synth[i]->status, synth[i]->wave, synth[i]->mod_source,
-            synth[i]->velocity, synth[i]->logratio, synth[i]->feedback, synth[i]->filter_type, synth[i]->resonance, synth[i]->portamento_alpha, P2F(synth[i]->step), synth[i]->chained_osc,
+    fprintf(stderr,"osc %" PRIu16 ": status %" PRIu8 " role %" PRIu8 " wave %" PRIu16 " mode %" PRIu16 " mod_source %" PRIu16 ",%" PRIu16 " velocity %f logratio %f feedback %f filtype %" PRIu8 " resonance %f portamento_alpha %f chained %" PRIu16 " algo %" PRIu8 " algo_source %" PRIu16 ",%" PRIu16 ",%" PRIu16 ",%" PRIu16 ",%" PRIu16 ",%" PRIu16 "  \n",
+            i, synth[i]->status, synth[i]->role, synth[i]->wave, synth[i]->mode, synth[i]->mod_source[0], synth[i]->mod_source[1],
+            synth[i]->velocity, synth[i]->logratio, synth[i]->feedback, synth[i]->filter_type, synth[i]->resonance, synth[i]->portamento_alpha, synth[i]->chained_osc,
             synth[i]->algorithm,
             synth[i]->algo_source[0], synth[i]->algo_source[1], synth[i]->algo_source[2], synth[i]->algo_source[3], synth[i]->algo_source[4], synth[i]->algo_source[5] );
     fprint_combo_coefs("amp_coefs", synth[i]->amp_coefs);
@@ -1099,7 +1240,7 @@ void print_osc_debug(uint16_t i /* osc */, bool show_eg) {
             }
             fprintf(stderr,"\n");
         }
-        fprintf(stderr,"mod osc %" PRIu16 ": amp: %f, logfreq %f duty %f filter_logfreq %f resonance %f fb/bw %f pan %f \n", i, msynth[i]->amp, msynth[i]->logfreq, msynth[i]->duty, msynth[i]->filter_logfreq, msynth[i]->resonance, msynth[i]->feedback, msynth[i]->pan);
+        fprintf(stderr,"mod osc %" PRIu16 ": amp: %f, logfreq %f duty %f filter_logfreq %f resonance %f fb/bw %f pan %f state %" PRIu16 "\n", i, msynth[i]->amp, msynth[i]->logfreq, msynth[i]->duty, msynth[i]->filter_logfreq, msynth[i]->resonance, msynth[i]->feedback, msynth[i]->pan, msynth[i]->state);
     }
 }
 
@@ -1126,7 +1267,12 @@ void show_debug(uint8_t type) {
     if(type>1) {
         // print out all the osc data
         //printf("global: filter %f resonance %f volume %f bend %f status %d\n", amy_global.filter_freq, amy_global.resonance, amy_global.volume, amy_global.pitch_bend, amy_global.status);
-        fprintf(stderr,"global: volume %.3f %.3f %.3f %.3f bend %f bus 0 eq: %f %f %f \n", amy_global.volume[0], amy_global.volume[1], amy_global.volume[2], amy_global.volume[3], amy_global.pitch_bend, S2F(amy_global.bus[0]->eq.eq[0]), S2F(amy_global.bus[0]->eq.eq[1]), S2F(amy_global.bus[0]->eq.eq[2]));
+        // One volume per configured bus -- this used to print four whatever
+        // max_buses is, which reads past the end of a build with fewer.
+        fprintf(stderr, "global: volume");
+        for (int bus = 0; bus < amy_global.config.max_buses; ++bus)
+            fprintf(stderr, " %.3f", amy_global.volume[bus]);
+        fprintf(stderr, " bend %f bus 0 eq: %f %f %f \n", amy_global.pitch_bend, S2F(amy_global.bus[0]->eq.eq[0]), S2F(amy_global.bus[0]->eq.eq[1]), S2F(amy_global.bus[0]->eq.eq[2]));
         for(uint16_t i=0;i<10 /* AMY_OSCS */;i++) {
             print_osc_debug(i, (type > 3) /* show_eg */);
         }
@@ -1135,6 +1281,7 @@ void show_debug(uint8_t type) {
         }
         if (type > 5) {
             midi_mapping_debug();
+            midi_active_channels_debug();
             cv_trigger_debug();
         }
         if (type > 6) {
@@ -1161,20 +1308,24 @@ void oscs_deinit() {
     cv_from_osc_deinit();
     cv_trigger_deinit();
     midi_mappings_deinit();
-    for (int bus = 0; bus < AMY_NUM_BUSES; ++bus) {
+    for (int bus = 0; bus < amy_global.config.max_buses; ++bus) {
         dealloc_chorus_delay_lines(bus);
         dealloc_echo_delay_lines(bus);
         dealloc_reverb_delay_lines(bus);
     }
     for(int core = 0; core < AMY_CORES; ++core) {
-        for (int bus = 0; bus < AMY_NUM_BUSES; ++bus) {
+        for (int bus = 0; bus < amy_global.config.max_buses; ++bus) {
             free(fbl[core][bus]);
             free(per_osc_fb[core][bus]);
         }
+        free(fbl[core]);
+        free(per_osc_fb[core]);
+        fbl[core] = NULL;
+        per_osc_fb[core] = NULL;
     }
     deltas_pool_free();
     // Include chorus osc (osc=AMY_OSCS)
-    for (int i = 0; i < AMY_OSCS + AMY_NUM_BUSES; ++i) free_osc(i);
+    for (int i = 0; i < AMY_OSCS + amy_global.config.max_buses; ++i) free_osc(i);
     free(amy_external_in_block);
     free(amy_in_block);
     free(output_block_1);
@@ -1191,15 +1342,13 @@ void oscs_deinit() {
         ks_deinit();
 }
 
-
-
 void osc_note_on(uint16_t osc, float initial_freq) {
     //fprintf(stderr,"Note on: osc %d wav %d note %.3f vel %.3f\n",
     //        osc, synth[osc]->wave,
     //        synth[osc]->midi_note, synth[osc]->velocity);
     // take care of fm & ks first -- no special treatment for bp/mod
     switch (synth[osc]->wave) {
-    case KS: if(amy_global.config.ks_oscs) ks_note_on(osc); break;
+    case KS: if(amy_global.config.ks_oscs) ks_note_on(osc, initial_freq); break;
     case SINE: sine_note_on(osc, initial_freq); break;
     case SAW_DOWN: saw_down_note_on(osc, initial_freq); break;
     case SAW_UP: saw_up_note_on(osc, initial_freq); break;
@@ -1232,7 +1381,10 @@ int chained_osc_would_cause_loop(uint16_t osc, uint16_t chained_osc) {
     // Check to see if chaining this osc would cause a loop.
     uint16_t next_osc = chained_osc;
     do {
-        ensure_osc_allocd(chained_osc, NULL);
+        // Walk without allocating: an osc with no storage is at its defaults,
+        // so its chained_osc is unset and the chain ends here -- no loop. The
+        // link site allocates what it is about to write to.
+        if (synth[next_osc] == NULL) return false;
         if (next_osc == osc) {
             fprintf(stderr, "chaining osc %d to osc %d would cause loop.\n",
                     chained_osc, osc);
@@ -1240,6 +1392,39 @@ int chained_osc_would_cause_loop(uint16_t osc, uint16_t chained_osc) {
         }
         next_osc = synth[next_osc]->chained_osc;
     } while(AMY_IS_SET(next_osc));
+    return false;
+}
+
+// Does `from` reach `target` by following mod_source edges?  With one mod
+// source per osc this was a walk down a chain; with NUM_MOD_SOURCES of them it
+// is a walk over a DAG, so it branches.  `budget` counts nodes visited: a
+// cycle-free graph of N oscs has at most NUM_MOD_SOURCES * N edges, so running
+// out means either a cycle or a graph too tangled to be worth chasing, and both
+// answer "yes" -- refusing a legal-but-absurd assignment is the safe direction.
+static bool mod_osc_reaches(uint16_t from, uint16_t target, int *budget) {
+    if (!AMY_IS_SET(from)) return false;
+    if ((*budget)-- <= 0) return true;
+    // Walk without allocating (see chained_osc_would_cause_loop): an osc with
+    // no storage has no mod_sources, so it reaches nothing.
+    if (synth[from] == NULL) return false;
+    if (from == target) return true;
+    for (int i = 0; i < NUM_MOD_SOURCES; ++i)
+        if (mod_osc_reaches(synth[from]->mod_source[i], target, budget)) return true;
+    return false;
+}
+
+int mod_osc_would_cause_loop(uint16_t osc, uint16_t mod_osc) {
+    // Check to see if setting one of osc's mod_sources to mod_osc would close a
+    // cycle.  Modulators may themselves be modulated (chained modulators):
+    // hold_and_modify() evaluates an osc's mod_sources recursively, so a cycle
+    // (e.g. a->b->a) would recurse without bound. Mirrors
+    // chained_osc_would_cause_loop() above.
+    int budget = NUM_MOD_SOURCES * AMY_OSCS;
+    if (mod_osc_reaches(mod_osc, osc, &budget)) {
+        fprintf(stderr, "osc %d as mod_source for osc %d would cause loop.\n",
+                mod_osc, osc);
+        return true;
+    }
     return false;
 }
 
@@ -1264,18 +1449,40 @@ void play_delta(struct delta *d) {
     //uint8_t trig=0;
     // todo: delta-only side effect, remove
 
-    if (d->param != RESET_OSC)  ensure_osc_allocd(d->osc, NULL);
+    if (d->param == FREE_OSC) {
+        // Voice release: ownership has ended and the state is discarded either
+        // way, so return the storage too. Reading an unallocated osc yields
+        // defaults, and the next touch re-allocates lazily. Handled before the
+        // ensure below so we don't allocate an osc on the way to freeing it.
+        if(d->data.i < (uint32_t)AMY_OSCS + amy_global.config.max_buses) {
+            free_osc(d->data.i);
+        }
+        AMY_PROFILE_STOP(PLAY_DELTA)
+        return;
+    }
+
+    if (d->param != RESET_OSC) {
+        // On OOM drop the delta; every branch below dereferences synth[d->osc].
+        if (!ensure_osc_allocd(d->osc, NULL)) {
+            AMY_PROFILE_STOP(PLAY_DELTA)
+            return;
+        }
+    }
 
     if(d->param == MIDI_NOTE) {
         // Midi note and Velocity are propagated to chained_osc.
+        // We ignore note values directed at MOD_SOURCE to avoid default voice note-on messing up mod_osc.
+        // We ignore note values directed at ALGO_SOURCE, PARTIAL, or CHAINED oscs because they get note values from their parents.
+        // Note, we're about to walk down the chain, but the *head* of the chain is not marked CHAINED.
         uint16_t osc = d->osc;
-        while(AMY_IS_SET(osc) &&
-              !(synth[osc]->status == SYNTH_IS_MOD_SOURCE
-                || synth[osc]->status == SYNTH_IS_ALGO_SOURCE
-                || synth[osc]->wave == PARTIAL)) {
-            // (We ignore note values directed at MOD_SOURCE to avoid default voice note-on messing up mod_osc.)
-            synth[osc]->midi_note = d->data.f;
-            osc = synth[osc]->chained_osc;
+        if (!(synth[osc]->role == SYNTH_IS_MOD_SOURCE
+              || synth[osc]->role == SYNTH_IS_ALGO_SOURCE
+              || synth[osc]->role == SYNTH_IS_CHAINED
+              || synth[osc]->wave == PARTIAL)) {
+            while(AMY_IS_SET(osc)) {
+                synth[osc]->midi_note = d->data.f;
+                osc = synth[osc]->chained_osc;
+            }
         }
     }
     if(d->param == WAVE) {
@@ -1286,23 +1493,40 @@ void play_delta(struct delta *d) {
             sine_note_on(d->osc, freq_of_logfreq(synth[d->osc]->logfreq_coefs[COEF_CONST]));
         }
     }
-    DELTA_TO_SYNTH_I(BUS, bus)
+    // MODE and PRESET are assigned together, because neither is valid on its
+    // own: a PCM_LOOP* mode on a file-backed preset is a configuration AMY
+    // cannot honor. Whichever of the pair this delta carries is checked
+    // against the value already on the osc, and refused with a warning rather
+    // than accepted and quietly doing something else at note-on. (Only one
+    // param matches per delta, so this reads as two cases but runs as one.)
+    if (d->param == MODE || d->param == PRESET) {
+        bool setting_mode = (d->param == MODE);
+        uint16_t mode = setting_mode ? (uint16_t)d->data.i : synth[d->osc]->mode;
+        uint16_t preset = setting_mode ? synth[d->osc]->preset : (uint16_t)d->data.i;
+        if (pcm_loop_config_allowed(d->osc, mode, preset, setting_mode)) {
+            if (setting_mode) synth[d->osc]->mode = mode;
+            else synth[d->osc]->preset = preset;
+        }
+    }
+    // Not DELTA_TO_SYNTH_I: the render loop indexes fbl[core][synth[osc]->bus]
+    // directly, and a delta can arrive from a patch stored when max_buses was
+    // higher than it is now, so this is the last place to catch a stale bus.
+    if (d->param == BUS) synth[d->osc]->bus = amy_validate_bus(d->data.i);
     DELTA_TO_SYNTH_F(FEEDBACK, feedback)
     DELTA_TO_SYNTH_F(RATIO, logratio)
     DELTA_TO_SYNTH_F(RESONANCE, resonance)
     DELTA_TO_SYNTH_I(FILTER_TYPE, filter_type)
-    DELTA_TO_SYNTH_I(NOTE_SOURCE_CHANNEL, note_source_channel)
+    DELTA_TO_SYNTH_I(NOTE_SOURCE_CHANNEL, s_note_source_channel)
     DELTA_TO_SYNTH_I(EG0_TYPE, eg_type[0])
     DELTA_TO_SYNTH_I(EG1_TYPE, eg_type[1])
-    if (d->param == PRESET) {
-        synth[d->osc]->preset = (uint16_t)d->data.i;
-    }
     if (d->param == PORTAMENTO) synth[d->osc]->portamento_alpha = portamento_ms_to_alpha(d->data.i);
     if (d->param == PHASE) {
         // Phase sets the *initial* phase of the osc.
         synth[d->osc]->trigger_phase = d->data.f;
         // .. but also warps the current phase to that value.
-        synth[d->osc]->phase = F2P(synth[d->osc]->trigger_phase);
+        // Skip for PCM because it doesn't really make much sense and causes brrr on web drum editor (#916).
+        if (!AMY_WAVE_IS_PCM(synth[d->osc]->wave))
+            synth[d->osc]->phase = F2P(synth[d->osc]->trigger_phase);
     }
     DELTA_TO_COEFS(AMP, amp_coefs)
     DELTA_TO_COEFS(FREQ, logfreq_coefs)
@@ -1322,7 +1546,11 @@ void play_delta(struct delta *d) {
                 max_num_breakpoints[i] = synth[d->osc]->max_num_breakpoints[i];
             max_num_breakpoints[bp_set] = bp_index + 1;
             // realloc rounds up in blocks of DEFAULT_NUM_BREAKPOINTS (8).
-            ensure_osc_allocd(d->osc, max_num_breakpoints);
+            // On OOM the osc keeps its old, smaller vectors: drop the delta.
+            if (!ensure_osc_allocd(d->osc, max_num_breakpoints)) {
+                AMY_PROFILE_STOP(PLAY_DELTA)
+                return;
+            }
         }
         if(pos % 2 == 0) {
             synth[d->osc]->breakpoint_times[bp_set][pos / 2] = d->data.i;
@@ -1351,14 +1579,35 @@ void play_delta(struct delta *d) {
     if(d->param == CHAINED_OSC) {
         int chained_osc = d->data.i;
         if (chained_osc >=0 && chained_osc < AMY_OSCS &&
-            !chained_osc_would_cause_loop(d->osc, chained_osc))
+            !chained_osc_would_cause_loop(d->osc, chained_osc) &&
+            ensure_osc_allocd(chained_osc, NULL)) {
             synth[d->osc]->chained_osc = chained_osc;
-        else
+            synth[chained_osc]->role = SYNTH_IS_CHAINED;
+        } else {
+            // If we were pointing to a chained osc, it would have been flagged as SYNTH_IS_CHAINED, but now it is not in fact chained.  So it should be ..?
+            if (AMY_IS_SET(synth[d->osc]->chained_osc))
+                synth[synth[d->osc]->chained_osc]->role = SYNTH_IS_NORMAL;
             AMY_UNSET(synth[d->osc]->chained_osc);
+        }
     }
-    if(d->param == RESET_OSC) { 
-        // Remember that RESET_AMY, RESET_TIMEBASE and RESET_EVENTS happens immediately in the parse, so we don't deal with it here.
-        if(d->data.i & RESET_ALL_OSCS) {
+    if(d->param == RESET_OSC) {
+        // Remember that RESET_AMY and RESET_EVENTS are handled at parse time -- they can't be
+        // carried in a delta -- so we don't deal with them here.
+        if(d->data.i & RESET_TIMEBASE) {
+            // Raise the flag only; the render thread re-zeroes the counters at
+            // the next block boundary.  That is what lets the timebase reset be
+            // an ordinary delta at all: play_delta is reachable from parse
+            // threads too (patch/transfer loads), and a flag is safe to raise
+            // from any of them, where the zeroing would not be.
+            // NOT amy_reset_sysclock(): we are inside flush_due_deltas(), which
+            // holds the amy lock that it grabs -- that self-deadlocks (a hang,
+            // not a crash).  Setting the flag here is already ordered by that
+            // same lock.
+            amy_global.reset_timebase_pending = 1;
+        }
+        // RESET_SYNTHS is a deprecated alias: it always did exactly this,
+        // just from the parse instead of from here.
+        if(d->data.i & (RESET_ALL_OSCS | RESET_SYNTHS)) {
             amy_reset_oscs();
         }
         if(d->data.i & RESET_SEQUENCER) {
@@ -1371,24 +1620,35 @@ void play_delta(struct delta *d) {
             // If we got here, it's a full reset of patches.
             patches_reset();
         }
-        if(d->data.i < (uint32_t)AMY_OSCS + AMY_NUM_BUSES) {
+        if(d->data.i < (uint32_t)AMY_OSCS + amy_global.config.max_buses) {
             reset_osc(d->data.i);
         }
     }
-    if(d->param == MOD_SOURCE) {
-        uint16_t mod_osc = d->data.i;
-        synth[d->osc]->mod_source = mod_osc;
-        // NOTE: These are delta-only side effects.  A purist would strive to remove them.
-        // When an oscillator is named as a modulator, we change its state.
-        ensure_osc_allocd(mod_osc, NULL);
-        synth[mod_osc]->status = SYNTH_IS_MOD_SOURCE;
-        // Remove default amplitude dependence on velocity when an oscillator is made a modulator.
-        synth[mod_osc]->amp_coefs[COEF_VEL] = 0;
-        // No longer record this osc in note_off state.
-        AMY_UNSET(synth[mod_osc]->note_off_clock);
-        // Start the mod osc.
-        synth[mod_osc]->note_on_clock = amy_global.total_samples;  // Need a note_on_clock to have envelope work correctly.. not that we care about envelope
-        osc_note_on(mod_osc, freq_of_logfreq(synth[mod_osc]->logfreq_coefs[COEF_CONST]));
+    if(d->param >= MOD_SOURCE_START && d->param < MOD_SOURCE_END) {
+        uint16_t which_source = d->param - MOD_SOURCE_START;
+        int mod_osc = d->data.i;
+        // Modulators may themselves have mod_sources (chained modulators, e.g.
+        // a slow LFO varying a vibrato LFO's rate or depth). That works because
+        // hold_and_modify() evaluates mod_sources recursively, so - as with
+        // CHAINED_OSC above - a cycle must be rejected before it is stored or
+        // the recursion never terminates.
+        if (mod_osc >= 0 && mod_osc < AMY_OSCS &&
+            !mod_osc_would_cause_loop(d->osc, mod_osc) &&
+            ensure_osc_allocd(mod_osc, NULL)) {
+            synth[d->osc]->mod_source[which_source] = mod_osc;
+            // NOTE: These are delta-only side effects.  A purist would strive to remove them.
+            // When an oscillator is named as a modulator, we change its state.
+            synth[mod_osc]->role = SYNTH_IS_MOD_SOURCE;
+            // Remove default amplitude dependence on velocity when an oscillator is made a modulator.
+            synth[mod_osc]->amp_coefs[COEF_VEL] = 0;
+            // No longer record this osc in note_off state.
+            AMY_UNSET(synth[mod_osc]->note_off_clock);
+            // Start the mod osc.
+            synth[mod_osc]->note_on_clock = amy_global.total_samples;  // Need a note_on_clock to have envelope work correctly.. not that we care about envelope
+            osc_note_on(mod_osc, freq_of_logfreq(synth[mod_osc]->logfreq_coefs[COEF_CONST]));
+        } else {
+            AMY_UNSET(synth[d->osc]->mod_source[which_source]);
+        }
     }
     if(d->param == ALGORITHM) {
         synth[d->osc]->algorithm = d->data.i;
@@ -1402,18 +1662,30 @@ void play_delta(struct delta *d) {
         synth[d->osc]->algo_source[which_source] = d->data.i;
         if(AMY_IS_SET(synth[d->osc]->algo_source[which_source])) {
             int osc = synth[d->osc]->algo_source[which_source];
-            ensure_osc_allocd(osc, NULL);
-            synth[osc]->status = SYNTH_IS_ALGO_SOURCE;
-            // Configure the amp envelope appropriately, just once when named as an algo_source.
-            synth[osc]->eg_type[0] = ENVELOPE_DX7;
+            // On OOM unset the source so render_algo never sees a NULL osc.
+            if (!ensure_osc_allocd(osc, NULL)) {
+                AMY_UNSET(synth[d->osc]->algo_source[which_source]);
+            } else {
+                synth[osc]->role = SYNTH_IS_ALGO_SOURCE;
+                // Configure the amp envelope appropriately, just once when named as an algo_source.
+                synth[osc]->eg_type[0] = ENVELOPE_DX7;
+            }
         }
     }
     // for global changes, just make the change, no need to update the per-osc synth
-    uint8_t bus = d->osc;  // We assume d.osc was hijacked in amy_event_to_deltas_queue
-    if(d->param >= VOLUME_BASE && (d->param - VOLUME_BASE + bus) < AMY_NUM_BUSES) amy_global.volume[d->param - VOLUME_BASE + bus] = d->data.f;
+    uint16_t bus = d->osc;  // We assume d.osc was hijacked in amy_event_to_deltas_queue
+    // ...but only for the bus-directed params below; for every other delta
+    // d->osc is an osc number, so clamp quietly rather than complaining about
+    // osc 12 not being a bus.
+    if (bus >= amy_global.config.max_buses) bus = AMY_DEFAULT_BUS;
+    if(d->param == VOLUME) amy_global.volume[bus] = d->data.f;
     if(d->param == PITCH_BEND) amy_global.pitch_bend = d->data.f;
     if(d->param == LATENCY) amy_global.latency_ms = d->data.i;
-    if(d->param == TEMPO) { amy_global.tempo = d->data.f; sequencer_recompute(); }
+    if(d->param == TEMPO) {
+        // Reject zero/negative/NaN tempo: sequencer_recompute divides by it.
+        if (d->data.f > 0) { amy_global.tempo = d->data.f; sequencer_recompute(); }
+        else fprintf(stderr, "bad tempo %f ignored\n", d->data.f);
+    }
     if(d->param == EQ_L) amy_global.bus[bus]->eq.eq[0] = F2S(powf(10, d->data.f / 20.0));
     if(d->param == EQ_M) amy_global.bus[bus]->eq.eq[1] = F2S(powf(10, d->data.f / 20.0));
     if(d->param == EQ_H) amy_global.bus[bus]->eq.eq[2] = F2S(powf(10, d->data.f / 20.0));
@@ -1447,18 +1719,15 @@ void play_delta(struct delta *d) {
             uint16_t osc = d->osc;
             //fprintf(stderr, "t %.3f: delta note_on: osc %d vel %.3f\n\r", amy_global.time, osc, d->data.f);
             while(AMY_IS_SET(osc)) {
-                //fprintf(stderr, "osc: %d wave %d status %d\n\r", osc, synth[osc]->wave, synth[osc]->status);
-                if (!(synth[osc]->status == SYNTH_IS_MOD_SOURCE
-                      || synth[osc]->status == SYNTH_IS_ALGO_SOURCE
+                //fprintf(stderr, "osc: %d wave %d role %d\n\r", osc, synth[osc]->wave, synth[osc]->role);
+                // Ignore velocity events for mod source / algo / partial notes.
+                if (!(synth[osc]->role == SYNTH_IS_MOD_SOURCE
+                      || synth[osc]->role == SYNTH_IS_ALGO_SOURCE
                       || synth[osc]->wave == PARTIAL)
                     && (AMY_IS_SET(synth[osc]->chained_osc)
                         || synth[osc]->amp_coefs[COEF_VEL] == 0
                         || synth[osc]->amp_coefs[COEF_VEL] > AMP_THRESH)) {
                     synth[osc]->velocity = d->data.f;  // was map_60dB_to_01f
-                    //fprintf(stderr, "osc: %d status -> AUDIBLE\n\r", osc);
-                    // Ignore velocity events for mod source or algo notes.
-                    synth[osc]->status = SYNTH_AUDIBLE;
-                    // ** no_amp_001
                     // an osc came in with a note on.
                     // start the bp clock
                     synth[osc]->note_on_clock = amy_global.total_samples; //esp_timer_get_time() / 1000;
@@ -1467,9 +1736,10 @@ void play_delta(struct delta *d) {
                     //if(synth[osc]->filter_type != FILTER_NONE) reset_filter(osc);
                     // We no longer reset the phase here; instead, we reset phase when an oscillator falls silent.
                     // But if a trigger_phase is set, use that.
-                    if (AMY_IS_SET(synth[osc]->trigger_phase))
+                    if (AMY_IS_SET(synth[osc]->trigger_phase) && !AMY_WAVE_IS_PCM(synth[osc]->wave)) {
+                        // PCM handles trigger_phase its own way in pcm_note_on.
                         synth[osc]->phase = F2P(synth[osc]->trigger_phase);
-
+                    }
                     // restart the waveforms
                     // Guess at the initial frequency depending only on const & note.  Envelopes not "developed" yet.
                     float initial_logfreq = synth[osc]->logfreq_coefs[COEF_CONST] + synth[osc]->logfreq_coefs[COEF_NOTE] * note_logfreq;
@@ -1481,44 +1751,44 @@ void play_delta(struct delta *d) {
 
                     float initial_freq = freq_of_logfreq(initial_logfreq);
                     osc_note_on(osc, initial_freq);
-                    // trigger the mod source, if we have one
-                    uint16_t mod_osc = synth[osc]->mod_source;
-                    if(AMY_IS_SET(mod_osc)) {
-                        if (AMY_IS_SET(synth[mod_osc]->trigger_phase))
-                            synth[mod_osc]->phase = F2P(synth[mod_osc]->trigger_phase);
-                        synth[mod_osc]->note_on_clock = amy_global.total_samples;  // Need a note_on_clock to have envelope work correctly.
-                        switch(synth[mod_osc]->wave) {
-                        case SINE: sine_mod_trigger(mod_osc); break;
-                        case SAW_DOWN: saw_up_mod_trigger(mod_osc); break;
-                        case SAW_UP: saw_down_mod_trigger(mod_osc); break;
-                        case TRIANGLE: triangle_mod_trigger(mod_osc); break;
-                        case PULSE: pulse_mod_trigger(mod_osc); break;
-                        case PCM:
-                        case PCM_LEFT:
-                        case PCM_RIGHT:
-                            pcm_mod_trigger(mod_osc);
-                            break;
-                        case CUSTOM: custom_mod_trigger(mod_osc); break;
+                    // trigger the mod sources, for however many we have
+                    for (int m = 0; m < NUM_MOD_SOURCES; ++m) {
+                        uint16_t mod_osc = synth[osc]->mod_source[m];
+                        if(AMY_IS_SET(mod_osc)) {
+                            if (AMY_IS_SET(synth[mod_osc]->trigger_phase))
+                                synth[mod_osc]->phase = F2P(synth[mod_osc]->trigger_phase);
+                            synth[mod_osc]->note_on_clock = amy_global.total_samples;  // Need a note_on_clock to have envelope work correctly.
+                            switch(synth[mod_osc]->wave) {
+                            case SINE: sine_mod_trigger(mod_osc); break;
+                            case SAW_DOWN: saw_up_mod_trigger(mod_osc); break;
+                            case SAW_UP: saw_down_mod_trigger(mod_osc); break;
+                            case TRIANGLE: triangle_mod_trigger(mod_osc); break;
+                            case PULSE: pulse_mod_trigger(mod_osc); break;
+                            case PCM:
+                            case PCM_LEFT:
+                            case PCM_RIGHT:
+                                pcm_mod_trigger(mod_osc);
+                                break;
+                            case CUSTOM: custom_mod_trigger(mod_osc); break;
+                            }
                         }
                     }
+                    // Set the AUDIBLE flag *after* osc_note_on.  pcm_note_on wants to know if osc was already active, looks at status.
+                    //fprintf(stderr, "osc: %d status -> AUDIBLE\n\r", osc);
+                    synth[osc]->status = SYNTH_AUDIBLE;
                 }
                 osc = synth[osc]->chained_osc;
             }
         } else if(synth[d->osc]->velocity > 0 && d->data.f == 0) { // new note off
             uint16_t osc = d->osc;
             while(AMY_IS_SET(osc)) {
-                if (!(synth[osc]->status == SYNTH_IS_MOD_SOURCE
-                      || synth[osc]->status == SYNTH_IS_ALGO_SOURCE
+                if (!(synth[osc]->role == SYNTH_IS_MOD_SOURCE
+                      || synth[osc]->role == SYNTH_IS_ALGO_SOURCE
                       || synth[osc]->wave == PARTIAL)) {
                     //synth[osc]->velocity = 0;
                     switch(synth[osc]->wave) {
                     case KS: ks_note_off(osc); break;
                     case ALGO: algo_note_off(osc); break;
-                    case PCM:
-                    case PCM_LEFT:
-                    case PCM_RIGHT:
-                        pcm_note_off(osc);
-                        break;
                     case AMY_MIDI: amy_send_midi_note_off(osc); break;
                     case CUSTOM: custom_note_off(osc); break;
                     case BYO_PARTIALS:
@@ -1527,6 +1797,19 @@ void play_delta(struct delta *d) {
                         synth[osc]->note_off_clock = amy_global.total_samples;
                         if(synth[osc]->wave==INTERP_PARTIALS) interp_partials_note_off(osc);
                         else partials_note_off(osc);
+                        break;
+                    case PCM:
+                    case PCM_LEFT:
+                    case PCM_RIGHT:
+                        pcm_note_off(osc);
+                        if (synth[osc]->mode == PCM_LOOP_FOREVER) {
+                            // Special case: with LOOP_FOREVER, we assume envelope is set.
+                            AMY_UNSET(synth[osc]->note_on_clock);
+                            if (AMY_IS_UNSET(synth[osc]->note_off_clock)) {
+                                // Only set the note_off_clock (start of release) if we don't already have one.
+                                synth[osc]->note_off_clock = amy_global.total_samples;
+                            }
+                        }
                         break;
                     default:
                         // ** no_amp_001
@@ -1564,7 +1847,7 @@ float amp_combine_controls(float *controls, float *coefs) {
         if (coef == 0)  continue;
         float val = controls[i];
         if (i == COEF_CONST)  {val = coef; coef = 1.0f;}   // coef[CONST] is always 1.0f, so swap them.  We're going to map the val.
-        if (i != COEF_MOD) {
+        if (i != COEF_MOD0 && i != COEF_MOD1) {
             val = map_60dB_to_01f(MAX(0, val)) - 1.0;    // const, vel, eg0, eg1 get log-compressed.
             // make 0 mean "no amp" and 1 mean "regular (full) amp".
         }
@@ -1594,7 +1877,8 @@ void hold_and_modify(uint16_t osc) {
     ctrl_inputs[COEF_VEL] = synth[osc]->velocity;
     ctrl_inputs[COEF_EG0] = S2F(compute_breakpoint_scale(osc, 0, 0));
     ctrl_inputs[COEF_EG1] = S2F(compute_breakpoint_scale(osc, 1, 0));
-    ctrl_inputs[COEF_MOD] = S2F(compute_mod_scale(osc));
+    ctrl_inputs[COEF_MOD0] = S2F(compute_mod_scale(osc, 0));
+    ctrl_inputs[COEF_MOD1] = S2F(compute_mod_scale(osc, 1));
     ctrl_inputs[COEF_BEND] = amy_global.pitch_bend;
     ctrl_inputs[COEF_EXT0] = cv_inputs[0];
     ctrl_inputs[COEF_EXT1] = cv_inputs[1];
@@ -1650,21 +1934,9 @@ void hold_and_modify(uint16_t osc) {
         ctrl_inputs[COEF_EG1] = S2F(compute_breakpoint_scale(osc, 1, AMY_BLOCK_SIZE));
         msynth[osc]->amp = amp_combine_controls(ctrl_inputs, synth[osc]->amp_coefs);
     }
-    // synth[osc]->feedback is copied to msynth in pcm_note_on, then used to track note-off for looping PCM.
-    // For PCM, don't re-copy it every loop, or we'd lose track of that flag.  (This means you can't change feedback mid-playback for PCM).
-    // we also check for custom, for tulips' memorypcm 
-    if (synth[osc]->wave != PCM && synth[osc]->wave != CUSTOM)  msynth[osc]->feedback = synth[osc]->feedback;
+    msynth[osc]->feedback = synth[osc]->feedback;
     msynth[osc]->resonance = synth[osc]->resonance;
 
-    if (osc == 999) {
-        fprintf(stderr, "h&m: time %f osc %d note %f vel %f eg0 %f eg1 %f ampc %.3f %.3f %.3f %.3f %.3f %.3f lfqc %.3f %.3f %.3f %.3f %.3f %.3f amp %f logfreq %f\n",
-               amy_global.time, osc,
-               ctrl_inputs[COEF_NOTE], ctrl_inputs[COEF_VEL], ctrl_inputs[COEF_EG0], ctrl_inputs[COEF_EG1],
-               synth[osc]->amp_coefs[0], synth[osc]->amp_coefs[1], synth[osc]->amp_coefs[2], synth[osc]->amp_coefs[3], synth[osc]->amp_coefs[4], synth[osc]->amp_coefs[5],
-               synth[osc]->logfreq_coefs[0], synth[osc]->logfreq_coefs[1], synth[osc]->logfreq_coefs[2], synth[osc]->logfreq_coefs[3], synth[osc]->logfreq_coefs[4], synth[osc]->logfreq_coefs[5],
-               msynth[osc]->amp, msynth[osc]->logfreq);
-
-    }
     AMY_PROFILE_STOP(HOLD_AND_MODIFY)
 
 }
@@ -1702,8 +1974,8 @@ void mix_with_pan(SAMPLE *stereo_dest, SAMPLE *mono_src, float pan_start, float 
         float rgain_start = rgain_of_pan(pan_start) * level;
         SAMPLE gain_l = F2S(lgain_start);
         SAMPLE gain_r = F2S(rgain_start);
-        SAMPLE d_gain_l = F2S((lgain_of_pan(pan_end) * level - lgain_start) / AMY_BLOCK_SIZE);
-        SAMPLE d_gain_r = F2S((rgain_of_pan(pan_end) * level - rgain_start) / AMY_BLOCK_SIZE);
+        SAMPLE d_gain_l = F2S((lgain_of_pan(pan_end) * level - lgain_start)) >> BLOCK_SIZE_BITS;
+        SAMPLE d_gain_r = F2S((rgain_of_pan(pan_end) * level - rgain_start)) >> BLOCK_SIZE_BITS;
         for(uint16_t i=0;i<AMY_BLOCK_SIZE;i++) {
             stereo_dest[i] += MUL8_SS(gain_l, mono_src[i]);
             stereo_dest[AMY_BLOCK_SIZE + i] += MUL8_SS(gain_r, mono_src[i]);
@@ -1830,7 +2102,7 @@ AMY_IRAM_ATTR void amy_render(uint16_t start, uint16_t end, uint8_t core) {
     SAMPLE max_max = 0;
     for(uint16_t osc=start; osc<end; osc++) {
         if(synth[osc] != NULL && synth[osc]->status == SYNTH_AUDIBLE) { // skip oscs that are silent or mod sources from playback
-            uint8_t bus = synth[osc]->bus;
+            uint16_t bus = synth[osc]->bus;
             bzero(per_osc_fb[core][bus], AMY_BLOCK_SIZE * sizeof(SAMPLE));
             SAMPLE max_val = render_osc_wave(osc, core, per_osc_fb[core][bus]);
             if (synth[osc]->status != SYNTH_AUDIBLE) {
@@ -1883,9 +2155,9 @@ AMY_IRAM_ATTR void amy_render(uint16_t start, uint16_t end, uint8_t core) {
 
     if(AMY_HAS_CHORUS && core == 0) {
         for(int bus = 0; bus <= amy_global.highest_bus; ++bus) {
-            ensure_osc_allocd(CHORUS_MOD_SOURCE + bus, NULL);
+            if (!ensure_osc_allocd(CHORUS_MOD_SOURCE + bus, NULL)) continue;
             hold_and_modify(CHORUS_MOD_SOURCE + bus);
-            if(amy_global.bus[bus]->chorus.level!=0)  {
+            if(amy_global.bus[bus]->chorus.level!=0 && amy_global.bus[bus]->chorus.delay_mod != NULL)  {
                 bzero(amy_global.bus[bus]->chorus.delay_mod, AMY_BLOCK_SIZE * sizeof(SAMPLE));
                 render_osc_wave(CHORUS_MOD_SOURCE + bus, 0 /* core */, amy_global.bus[bus]->chorus.delay_mod);
             }
@@ -1903,16 +2175,20 @@ AMY_IRAM_ATTR void amy_render(uint16_t start, uint16_t end, uint8_t core) {
 }
 
 
-// this plays just the next delta if it's time.
-void amy_execute_delta() {
-    AMY_PROFILE_START(AMY_EXECUTE_DELTAS)
+// Play any deltas that are due, without advancing the sequencer. Split out
+// of amy_execute_deltas() so the event-ingest path can settle deltas before
+// a patch load: events may arrive on any thread, and the sequencer tick
+// service is rendering-context-only (unguarded RMW on next_amy_tick_us, and
+// the external hook expects audio-thread context). Everything here is under
+// the queue lock - safe from any thread.
+static void flush_due_deltas() {
     // check to see which sounds to play
     uint32_t sysclock = amy_sysclock();
     amy_grab_lock();
 
     // find any deltas that need to be played from the (in-order) queue
     struct delta *d = amy_global.delta_queue;
-    if(d && sysclock >= d->time) {
+    while(d && AMY_TIME_GEQ(sysclock, d->time)) {
         play_delta(d);
         d = delta_release(d);
         amy_global.delta_qsize--;
@@ -1920,35 +2196,17 @@ void amy_execute_delta() {
     amy_global.delta_queue = d;
 
     amy_release_lock();
-
-    AMY_PROFILE_STOP(AMY_EXECUTE_DELTAS)
-
 }
 
 // this takes scheduled deltas and plays them at the right time
 void amy_execute_deltas() {
     AMY_PROFILE_START(AMY_EXECUTE_DELTAS)
-    // Advance the sequencer on AMY (sample) time and queue any due sequence
+    // Advance the sequencer on AMY (sample) time and play any due sequence
     // events, so sequencing works in any rendering context, real-time or not.
     sequencer_check_and_fill();
     // Make sure any CV-triggered events are added to delta queue
     update_external_cv_in();
-
-    // check to see which sounds to play
-    uint32_t sysclock = amy_sysclock();
-    amy_grab_lock();
-
-    // find any deltas that need to be played from the (in-order) queue
-    struct delta *d = amy_global.delta_queue;
-    while(d && sysclock >= d->time) {
-        play_delta(d);
-        d = delta_release(d);
-        amy_global.delta_qsize--;
-    }
-    amy_global.delta_queue = d;
-
-    amy_release_lock();
-
+    flush_due_deltas();
     AMY_PROFILE_STOP(AMY_EXECUTE_DELTAS)
 
 }
@@ -1973,6 +2231,34 @@ void amy_block_processed(void) {
 
 int16_t * amy_fill_buffer() {
     AMY_PROFILE_START(AMY_FILL_BUFFER)
+    // A requested timebase reset lands here, between blocks on the render
+    // thread, so it cannot race this thread's own sequencer pacing
+    // (sequencer_check_and_fill's read-modify-write of next_amy_tick_us) or
+    // the block counting below.  The lock orders it against a concurrent
+    // amy_reset_sysclock().
+    if (amy_global.reset_timebase_pending) {
+        amy_grab_lock();
+        // Rebase queued deltas onto the new timeline so their relative timing
+        // survives the reset: a delta due 200 ms from now is still due 200 ms
+        // from now, and one already due plays on this block.  (RESET_EVENTS is
+        // the way to drop them instead.)  Doing this here rather than when the
+        // reset was requested also covers deltas queued in between, which were
+        // scheduled against the clock as it still read then.
+        uint32_t old_sysclock = (uint32_t)amy_sysclock64();
+        struct delta *d = amy_global.delta_queue;
+        while (d != NULL) {
+            if (AMY_TIME_GEQ(old_sysclock, d->time)) d->time = 0;
+            else d->time = d->time - old_sysclock;  // unsigned wrap keeps "in the future by k ms"
+            d = d->next;
+        }
+        amy_global.total_blocks = 0;
+        amy_global.total_samples = 0;
+        amy_global.time = 0;
+        amy_global.sequencer_tick_count = 0;
+        sequencer_recompute();
+        amy_global.reset_timebase_pending = 0;
+        amy_release_lock();
+    }
     #ifdef __EMSCRIPTEN__
     // post a message to the main thread of the audioworklet (amy main, in this case) that a block has been finished
     //emscripten_audio_worklet_post_function_v(0, amy_block_processed);
@@ -2052,7 +2338,7 @@ int16_t * amy_fill_buffer() {
         #endif
     }  // end of per-bus FX
     // global volume is supposed to max out at 10, so scale by 0.1.
-    SAMPLE volume_scale[AMY_NUM_BUSES];
+    SAMPLE *volume_scale = amy_global.volume_scale;  // max_buses long, allocated at start.
     for (int bus = 0; bus <= amy_global.highest_bus; ++bus)
         volume_scale[bus] = MUL4_SS(F2S(0.1f), F2S(amy_global.volume[bus]));
     for(int16_t i=0; i < AMY_BLOCK_SIZE; ++i) {
@@ -2095,20 +2381,20 @@ int16_t * amy_fill_buffer() {
             // TODO -- the esp stuff here could sit outside of AMY
             // For some reason, have to drop a bit to stop hard wrapping on esp?
 #if defined(ESP_PLATFORM) || defined(__IMXRT1062__)
-                uintval >>= 1;
-            #endif
+            uintval >>= 1;
+#endif
             if (positive) {
               sample = uintval;
             } else {
               sample = -uintval;
             }
             if(AMY_NCHANS == 1) {
-                #ifdef ESP_PLATFORM
+#ifdef ESP_PLATFORM
                     // esp32's i2s driver has this bug
                     output_block[i ^ 0x01] = sample;
-                #else
+#else
                     output_block[i] = sample;
-                #endif
+#endif
             } else {
                 output_block[(AMY_NCHANS * i) + c] = sample;
             }
@@ -2138,7 +2424,7 @@ int16_t * amy_fill_buffer() {
     }
     amy_global.total_blocks++;
     amy_global.total_samples = amy_global.total_blocks * AMY_BLOCK_SIZE;
-    amy_global.time = amy_global.total_samples / (float)AMY_SAMPLE_RATE;
+    amy_global.time = amy_global.total_samples * (1.0f / AMY_SAMPLE_RATE);
 
     AMY_PROFILE_STOP(AMY_FILL_BUFFER)
 
@@ -2146,12 +2432,19 @@ int16_t * amy_fill_buffer() {
     return output_block;
 }
 
+// Request a timebase reset: the millisecond clock and the sequencer tick
+// count restart from zero, and queued events keep their relative timing.
+// The render thread applies it at the next block boundary (amy_fill_buffer()),
+// within a few ms.  Zeroing the counters here -- this runs on whichever
+// thread called amy_add_message() -- raced the render thread:
+// sequencer_check_and_fill() had already computed now_us against the old
+// clock, this call re-anchored next_amy_tick_us near zero underneath it, and
+// its catch-up loop then replayed thousands of ticks in one block, smearing
+// every periodic sequence into a continuous roll for seconds.
 void amy_reset_sysclock() {
-    amy_global.total_blocks = 0;
-    amy_global.total_samples = 0;
-    amy_global.time = 0;
-    amy_global.sequencer_tick_count = 0;
-    sequencer_recompute();
+    amy_grab_lock();
+    amy_global.reset_timebase_pending = 1;
+    amy_release_lock();
 }
 
 
@@ -2168,6 +2461,7 @@ int next_delta_block = 0;
 struct delta *deltas_pool_alloc(int max_delta_pool_size, struct delta *tail) {
     struct delta *new_pool = (struct delta *)malloc_caps(max_delta_pool_size * sizeof(struct delta),
                                                          amy_global.config.ram_caps_synth);
+    if (new_pool == NULL) return NULL;
     struct delta *d = new_pool;
     // Link all the deltas together
     for (int i = 1; i < max_delta_pool_size; ++i) {
@@ -2188,7 +2482,12 @@ void deltas_add_pool_block(void) {
         fprintf(stderr, "**PANIC: Ran out of deltas (%d blocks of %d deltas)\n", MAX_DELTA_BLOCKS, DELTA_BLOCK_SIZE);
         abort();
     }
-    free_deltas_pool = delta_blocks[next_delta_block++] = deltas_pool_alloc(DELTA_BLOCK_SIZE, free_deltas_pool);
+    struct delta *block = deltas_pool_alloc(DELTA_BLOCK_SIZE, free_deltas_pool);
+    if (block == NULL) {
+        amy_oom("deltas_add_pool_block: out of memory - events will be dropped\n");
+        return;
+    }
+    free_deltas_pool = delta_blocks[next_delta_block++] = block;
 }
 
 void deltas_pool_init() {
@@ -2210,6 +2509,8 @@ struct delta *delta_get(struct delta *from) {
     if (d == NULL)  {
         deltas_add_pool_block();
         d = free_deltas_pool;
+        // Pool couldn't grow; callers handle NULL.
+        if (d == NULL) return NULL;
     }
     free_deltas_pool = d->next;
     if (from != NULL) {

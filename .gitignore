@@ -3,6 +3,12 @@ amy-example
 amy-message
 failed_tests.txt
 tests/tst
+tests/test_clock_wrap
+tests/test_sequencer_active
+tests/test_sequencer_bounds
+tests/test_bus_config
+tests/test_patch_slots
+tests/test_synth_readout
 amy-piano
 src/build/
 *.DS_Store*
@@ -71,3 +77,7 @@ Mkfile.old
 dkms.conf
 godot/.sconsign.dblite
 godot/src/*.os
+tests/test_clone_on_grow
+tests/test_log2_lut
+tests/test_osc_free_on_release
+tests/test_timebase_reset

@@ -43,6 +43,8 @@ const FILTER_LPF: int = 1
 const FILTER_BPF: int = 2
 const FILTER_HPF: int = 3
 const FILTER_LPF24: int = 4
+const FILTER_NOTCH: int = 5
+const FILTER_PHASER: int = 6
 
 # ============================================================
 #  Envelope types
@@ -73,6 +75,8 @@ const ENVELOPE_TRUE_EXPONENTIAL: int = 3
 @export var audio_in: bool = false
 ## Maximum number of oscillators.
 @export var max_oscs: int = 180
+## Number of FX buses. No upper limit beyond available memory.
+@export var max_buses: int = 4
 ## Maximum number of voices.
 @export var max_voices: int = 64
 ## Maximum number of synths.
@@ -112,6 +116,7 @@ func _init_native() -> void:
 	_synth.set("startup_bleep", startup_bleep)
 	_synth.set("audio_in", audio_in)
 	_synth.set("max_oscs", max_oscs)
+	_synth.set("max_buses", max_buses)
 	_synth.set("max_voices", max_voices)
 	_synth.set("max_synths", max_synths)
 
@@ -248,12 +253,30 @@ func _format_list(val: Variant) -> String:
 	return str(val)
 
 ## Format a control coefficient value.
-## Can be a number (treated as const), a string, or an array.
+## Can be a number (treated as const), a string, an array, or a dictionary
+## keyed by COEF_FIELDS name, e.g. {"const": 220, "mod0": 0.1}.
 func _format_ctrl(val: Variant) -> String:
 	if val is float or val is int:
 		return _trunc(float(val))
 	if val is String:
 		return str(val)
+	if val is Dictionary:
+		var vals: Array = []
+		vals.resize(COEF_FIELDS.size())
+		for key: Variant in val:
+			var name: String = COEF_ALIASES.get(str(key), str(key))
+			var idx: int = COEF_FIELDS.find(name)
+			if idx < 0:
+				push_error("Unknown ctrl_coef field: %s. Valid: %s" % [key, ", ".join(COEF_FIELDS)])
+				return ""
+			vals[idx] = val[key]
+		# Trailing unset coefs can just be left off the wire string.
+		while vals.size() > 0 and vals[vals.size() - 1] == null:
+			vals.resize(vals.size() - 1)
+		var coefs: PackedStringArray = PackedStringArray()
+		for item: Variant in vals:
+			coefs.append("" if item == null else _trunc(float(item)))
+		return ",".join(coefs)
 	if val is Array:
 		var parts: PackedStringArray = PackedStringArray()
 		for item: Variant in val:
@@ -269,6 +292,7 @@ func _format_ctrl(val: Variant) -> String:
 # ============================================================
 # BEGIN GENERATED - scripts/gen_amy_gd_api.py
 var _KW_MAP: Dictionary = {
+	"ticks":               ["H", "L"],
 	"osc":                 ["v", "I"],
 	"wave":                ["w", "I"],
 	"note":                ["n", "F"],
@@ -277,12 +301,11 @@ var _KW_MAP: Dictionary = {
 	"freq":                ["f", "C"],
 	"duty":                ["d", "C"],
 	"feedback":            ["b", "F"],
-	"time":                ["t", "I"],
 	"reset":               ["S", "I"],
 	"phase":               ["P", "F"],
 	"pan":                 ["Q", "C"],
 	"client":              ["g", "I"],
-	"volume":              ["V", "L"],
+	"volume":              ["V", "F"],
 	"pitch_bend":          ["s", "F"],
 	"filter_freq":         ["F", "C"],
 	"resonance":           ["R", "F"],
@@ -294,7 +317,7 @@ var _KW_MAP: Dictionary = {
 	"eg1_type":            ["X", "I"],
 	"debug":               ["D", "I"],
 	"chained_osc":         ["c", "I"],
-	"mod_source":          ["L", "I"],
+	"mod_source":          ["L", "L"],
 	"eq":                  ["x", "L"],
 	"filter_type":         ["G", "I"],
 	"ratio":               ["I", "F"],
@@ -308,10 +331,8 @@ var _KW_MAP: Dictionary = {
 	"reverb":              ["h", "L"],
 	"echo":                ["M", "L"],
 	"patch":               ["K", "I"],
-	"voices":              ["r", "L"],
 	"external_channel":    ["W", "I"],
 	"portamento":          ["m", "I"],
-	"sequence":            ["H", "L"],
 	"tempo":               ["j", "F"],
 	"sequencer_run":       ["zY", "I"],
 	"external_midi_sync":  ["zC", "I"],
@@ -330,6 +351,7 @@ var _KW_MAP: Dictionary = {
 	"start_sample":        ["zS", "L"],
 	"stop_sample":         ["zO", "I"],
 	"bus":                 ["y", "I"],
+	"mode":                ["ww", "I"],
 	"midi_cc":             ["ic", "L"],
 	"midi_note_cmd":       ["io", "L"],
 	"cv_trigger":          ["ig", "L"],
@@ -337,15 +359,15 @@ var _KW_MAP: Dictionary = {
 }
 
 var _KW_PRIORITY: Dictionary = {
-	"osc": 0,
-	"wave": 1,
-	"note": 2,
-	"vel": 3,
-	"amp": 4,
-	"freq": 5,
-	"duty": 6,
-	"feedback": 7,
-	"time": 8,
+	"ticks": 0,
+	"osc": 1,
+	"wave": 2,
+	"note": 3,
+	"vel": 4,
+	"amp": 5,
+	"freq": 6,
+	"duty": 7,
+	"feedback": 8,
 	"reset": 9,
 	"phase": 10,
 	"pan": 11,
@@ -376,31 +398,95 @@ var _KW_PRIORITY: Dictionary = {
 	"reverb": 36,
 	"echo": 37,
 	"patch": 38,
-	"voices": 39,
-	"external_channel": 40,
-	"portamento": 41,
-	"sequence": 42,
-	"tempo": 43,
-	"sequencer_run": 44,
-	"external_midi_sync": 45,
-	"synth": 46,
-	"pedal": 47,
-	"synth_flags": 48,
-	"num_voices": 49,
-	"oscs_per_voice": 50,
-	"synth_level": 51,
-	"to_synth": 52,
-	"grab_midi_notes": 53,
-	"note_source_channel": 54,
-	"synth_delay": 55,
-	"preset": 56,
-	"num_partials": 57,
-	"start_sample": 58,
-	"stop_sample": 59,
-	"bus": 60,
-	"midi_cc": 61,
-	"midi_note_cmd": 62,
-	"cv_trigger": 63,
-	"patch_string": 64,
+	"external_channel": 39,
+	"portamento": 40,
+	"tempo": 41,
+	"sequencer_run": 42,
+	"external_midi_sync": 43,
+	"synth": 44,
+	"pedal": 45,
+	"synth_flags": 46,
+	"num_voices": 47,
+	"oscs_per_voice": 48,
+	"synth_level": 49,
+	"to_synth": 50,
+	"grab_midi_notes": 51,
+	"note_source_channel": 52,
+	"synth_delay": 53,
+	"preset": 54,
+	"num_partials": 55,
+	"start_sample": 56,
+	"stop_sample": 57,
+	"bus": 58,
+	"mode": 59,
+	"midi_cc": 60,
+	"midi_note_cmd": 61,
+	"cv_trigger": 62,
+	"patch_string": 63,
 }
+
+## The control coefficient inputs, in wire order.  Prefer naming these in a
+## Dictionary over writing a positional Array: anything past the modulators
+## shifts position whenever a new control input is added.
+const COEF_FIELDS: PackedStringArray = ["const", "note", "vel", "eg0", "eg1", "mod0", "bend", "ext0", "ext1", "mod1"]
+
+## Superseded coef names, kept working: {old: new}.
+const COEF_ALIASES: Dictionary = {"mod": "mod0"}
 # END GENERATED
+
+## Reset bit for the timebase, mirroring RESET_TIMEBASE in src/amy.h.
+const RESET_TIMEBASE: int = 16384
+
+# ============================================================
+#  Table-driven C API (native + web). Regenerate: make c-api
+# ============================================================
+# BEGIN GENERATED C API - scripts/gen_amy_c_api.py
+## Smoothed fraction of real time AMY spends rendering (0..1)
+func render_load() -> float:
+	if _is_web:
+		var v: Variant = JavaScriptBridge.eval("amy_c_api ? amy_c_api.render_load() : null", true)
+		return 0.0 if v == null else float(v)
+	if _synth:
+		return _synth.call("render_load")
+	return 0.0
+
+## Set the render-load fraction that trips the overload failsafe (0 disables)
+func set_render_load_threshold(threshold: float) -> void:
+	if _is_web:
+		JavaScriptBridge.eval("amy_c_api && amy_c_api.set_render_load_threshold(%s)" % [str(threshold)])
+	elif _synth:
+		_synth.call("set_render_load_threshold", threshold)
+
+## Play the startup bleep
+func bleep(start: int = 0) -> void:
+	if _is_web:
+		JavaScriptBridge.eval("amy_c_api && amy_c_api.bleep(%s)" % [str(start)])
+	elif _synth:
+		_synth.call("bleep", start)
+
+## Read the sequencer tick count
+func sequencer_ticks() -> int:
+	if _is_web:
+		var v: Variant = JavaScriptBridge.eval("amy_c_api ? amy_c_api.sequencer_ticks() : null", true)
+		return 0 if v == null else int(v)
+	if _synth:
+		return _synth.call("sequencer_ticks")
+	return 0
+
+## Read the complete replayable AMY state as a wire-command string
+func dump_state() -> String:
+	if _is_web:
+		var v: Variant = JavaScriptBridge.eval("amy_c_api ? amy_c_api.dump_state() : null", true)
+		return "" if v == null else String(v)
+	if _synth:
+		return _synth.call("dump_state")
+	return ""
+
+# END GENERATED C API
+
+
+## Reset the AMY millisecond clock and sequencer tick count to zero.
+## Native rather than a C binding: RESET_TIMEBASE is an ordinary event, so this
+## is just a send(), and the reset follows the same path as anything else sent.
+func reset_sysclock() -> void:
+	send({"reset": RESET_TIMEBASE})

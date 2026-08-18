@@ -29,6 +29,10 @@ void AmySynth::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_sysclock"), &AmySynth::get_sysclock);
 	ClassDB::bind_method(D_METHOD("is_running"), &AmySynth::is_running);
 
+	// Generated table-driven C API bindings (reset_sysclock, render_load,
+	// dump_state, ...). Regenerate with `make c-api`.
+#include "amy_c_api_gd_bind.inc"
+
 	// Config property bindings — set before calling start()
 	ClassDB::bind_method(D_METHOD("set_chorus", "enabled"), &AmySynth::set_chorus);
 	ClassDB::bind_method(D_METHOD("get_chorus"), &AmySynth::get_chorus);
@@ -66,6 +70,10 @@ void AmySynth::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_max_oscs"), &AmySynth::get_max_oscs);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "max_oscs"), "set_max_oscs", "get_max_oscs");
 
+	ClassDB::bind_method(D_METHOD("set_max_buses", "count"), &AmySynth::set_max_buses);
+	ClassDB::bind_method(D_METHOD("get_max_buses"), &AmySynth::get_max_buses);
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "max_buses"), "set_max_buses", "get_max_buses");
+
 	ClassDB::bind_method(D_METHOD("set_max_voices", "count"), &AmySynth::set_max_voices);
 	ClassDB::bind_method(D_METHOD("get_max_voices"), &AmySynth::get_max_voices);
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "max_voices"), "set_max_voices", "get_max_voices");
@@ -89,6 +97,7 @@ void AmySynth::start() {
 	config.features.startup_bleep = startup_bleep ? 1 : 0;
 	config.features.audio_in = audio_in ? 1 : 0;
 	config.max_oscs = max_oscs;
+	config.max_buses = max_buses;
 	config.max_voices = max_voices;
 	config.max_synths = max_synths;
 	amy_start(config);
@@ -183,7 +192,12 @@ void AmySynth::set_audio_in(bool p_val) { audio_in = p_val; }
 bool AmySynth::get_audio_in() const { return audio_in; }
 void AmySynth::set_max_oscs(int p_val) { max_oscs = p_val; }
 int AmySynth::get_max_oscs() const { return max_oscs; }
+void AmySynth::set_max_buses(int p_val) { max_buses = p_val; }
+int AmySynth::get_max_buses() const { return max_buses; }
 void AmySynth::set_max_voices(int p_val) { max_voices = p_val; }
 int AmySynth::get_max_voices() const { return max_voices; }
 void AmySynth::set_max_synths(int p_val) { max_synths = p_val; }
 int AmySynth::get_max_synths() const { return max_synths; }
+
+// Generated table-driven C API method bodies. Regenerate with `make c-api`.
+#include "amy_c_api_gd_impl.inc"

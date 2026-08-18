@@ -24,7 +24,7 @@ typedef struct {
     uint32_t length;
     uint32_t loopstart;
     uint32_t loopend;
-    uint8_t midinote;
+    float midinote;   // fractional, so a sample's tuning correction can live in the preset
     uint32_t samplerate;
     float log2sr;
 } memorypcm_preset_t;
@@ -147,6 +147,8 @@ void pcm_deinit() {
 #define PCM_INDEX_FRAC_BITS 8
 // The number of bits used to hold the table index.
 #define PCM_INDEX_BITS (31 - PCM_INDEX_FRAC_BITS)
+// The phase advance step within a block is calculated with this many additional bits beyond PCM_INDEX_FRAC_BITS
+#define PCM_INDEX_STEP_EXTRA_BITS 8
 
 static void fclose_if_file(memorypcm_preset_t *preset) {
     if (preset == NULL) {
@@ -158,6 +160,112 @@ static void fclose_if_file(memorypcm_preset_t *preset) {
         amy_global.config.amy_external_fclose_hook(preset->file_handle);
         preset->file_handle = 0;
     }
+}
+
+static bool mode_is_looping(uint16_t mode) {
+    return mode == PCM_LOOP || mode == PCM_LOOP_STOP || mode == PCM_LOOP_FOREVER;
+}
+
+// True if `preset_number` streams from a file rather than sitting in memory.
+// `filename_out`, when non-NULL, receives the file name for the message.
+static bool preset_is_file(uint16_t preset_number, const char **filename_out) {
+    if (AMY_IS_UNSET(preset_number)) return false;
+    memorypcm_preset_t rom_local;
+    memorypcm_preset_t *preset = get_preset_for_preset_number(preset_number, &rom_local);
+    if (preset == NULL || preset->type != AMY_PCM_TYPE_FILE) return false;
+    if (filename_out != NULL) *filename_out = preset->filename;
+    return true;
+}
+
+// A file-backed preset streams through a small sliding buffer rather than
+// sitting in a table we can index freely, so there is nothing to loop back
+// into: render_pcm refills from the file each block and rewinds phase to the
+// top of the fresh buffer. A PCM_LOOP* mode on such a preset can never do
+// what it says.
+//
+// Rather than accept the command and quietly do something else at note-on,
+// refuse it where it is issued -- when the mode changes, and when the preset
+// number changes -- so the configuration never reaches a state it can't
+// honor, and the user hears about it while the offending command is still in
+// front of them. Called with the *proposed* mode and preset; returns false if
+// the command should be dropped.
+//
+// (Whole-file looping *would* be implementable on top of the fseek+re-parse
+// rewind pcm_note_on already does; what a stream can never honor is the
+// loopstart/loopend marks. That's a bigger change than this one.)
+bool pcm_loop_config_allowed(uint16_t osc, uint16_t mode, uint16_t preset_number,
+                             bool mode_is_the_new_part) {
+    // mode means nothing outside PCM, so don't second-guess other waves.
+    if (synth[osc]->wave != PCM) return true;
+    if (!mode_is_looping(mode)) return true;
+    const char *filename = NULL;
+    if (!preset_is_file(preset_number, &filename)) return true;
+    if (mode_is_the_new_part) {
+        fprintf(stderr, "amy: osc %d preset %d streams from %s, which cannot loop; "
+                        "ignoring mode=%d. Use load_sample() to loop.\n",
+                osc, preset_number, filename ? filename : "a file", mode);
+    } else {
+        fprintf(stderr, "amy: preset %d streams from %s, which cannot loop, but osc %d "
+                        "is in mode=%d; ignoring preset=%d. Set a non-loop mode first, "
+                        "or use load_sample().\n",
+                preset_number, filename ? filename : "a file", osc, mode, preset_number);
+    }
+    return false;
+}
+
+// Sample value close enough to zero to stop sample
+#define PCM_ZERO_THRESH 16
+// How far forward to search for a zero crossing
+#define PCM_MAX_ZERO_SEARCH_LEN 512
+
+int pcm_find_next_zero_crossing(uint16_t osc, uint32_t base_index) {
+    // Find next zero or zero crossing beyond base_index in PCM under osc.
+    int index = -1;
+    if(AMY_IS_SET(synth[osc]->preset)) {
+        memorypcm_preset_t rom_local;
+        memorypcm_preset_t *preset =
+            get_preset_for_preset_number(synth[osc]->preset, &rom_local);
+        uint32_t sample_length = preset->length;
+        const LUTSAMPLE* table = preset->sample_ram;
+        int last_sign = 0;
+        int sign;
+        if (preset->type != AMY_PCM_TYPE_FILE
+            && table != NULL
+            && sample_length != 0) {
+            const LUTSAMPLE* table = preset->sample_ram;
+            //uint32_t start_index = base_index;  // for debug only
+            LUTSAMPLE min_val = SAMPLE_MAX;
+            LUTSAMPLE val;
+            for(uint16_t i=0; i < PCM_MAX_ZERO_SEARCH_LEN; i++) {
+                // For non-file samples, we have to check for end of sample/looping.
+                if (base_index >= sample_length) break;
+                if (preset->channels == 2) {
+                    if (synth[osc]->wave == PCM_LEFT) {
+                        val = table[base_index * 2];
+                    } else if (synth[osc]->wave == PCM_RIGHT) {
+                        val = table[base_index * 2 + 1];
+                    } else { // PCM or PCM_MIX
+                        val = (LUTSAMPLE)(((int32_t)table[base_index * 2] + (int32_t)table[base_index * 2 + 1]) / 2);
+                    }
+                } else {
+                    val = table[base_index];
+                }
+                sign = 1;
+                if (val < 0) {sign = -1; val = -val;}
+                if (val < min_val) {
+                    min_val = val;
+                    index = base_index;
+                }
+                if ((val <= PCM_ZERO_THRESH) || ((sign * last_sign) == -1))
+                    break;
+                last_sign = sign;
+                ++base_index;
+            }
+            //fprintf(stderr, "time %.3f: pcm_find_zero: osc %d start %d base %d len %d min_val %d index %d sign %d last %d\n",
+            //        amy_global.time, osc, start_index, base_index, sample_length, min_val, index, sign, last_sign);
+        }
+    }
+    return index;
 }
 
 void pcm_note_on(uint16_t osc) {
@@ -183,18 +291,30 @@ void pcm_note_on(uint16_t osc) {
             // baked-in PCM - don't overrun.
             if(synth[osc]->preset >= pcm_samples) synth[osc]->preset = 0;
         }
-        
+        PHASOR phase;
         if (AMY_IS_SET(synth[osc]->trigger_phase)) {
             // trigger_phase (P) sets the sample start point for this
             // note-on (start_frame / 2^PCM_INDEX_BITS).
-            synth[osc]->phase = F2P(synth[osc]->trigger_phase);
+            phase = F2P(synth[osc]->trigger_phase);
         } else {
-            synth[osc]->phase = 0; // s16.15 index into the table; as if a PHASOR into a 16 bit sample table.
+            phase = 0; // s16.15 index into the table; as if a PHASOR into a 16 bit sample table.
         }
-        // Special case: We use the msynth feedback flag to indicate note-off for looping PCM.  As a result, it's explicitly NOT set in amy:hold_and_modify for PCM voices.  Set it here.
-        msynth[osc]->feedback = synth[osc]->feedback;
-
-        // Make sure PCM waveforms are excluded from auto-termination, so we don't cut-off samples with silent gaps.
+        if (synth[osc]->status == SYNTH_AUDIBLE && preset->type != AMY_PCM_TYPE_FILE) {
+            // Restarting a currently-playing (non-file) PCM, delay reonset to next zero crossing to avoid click.
+            uint32_t base_index = INT_OF_P(synth[osc]->phase, PCM_INDEX_BITS);
+            msynth[osc]->loopend = pcm_find_next_zero_crossing(osc, base_index);
+            msynth[osc]->loopstart = INT_OF_P(phase, PCM_INDEX_BITS);;
+            msynth[osc]->state = PCM_LOOP_ONCE_INTERNAL;
+            msynth[osc]->next_state = synth[osc]->mode;
+            //fprintf(stderr, "time %.3f osc %d RESTART amp %.3f last_amp %.3f\n", amy_global.time, osc, msynth[osc]->amp, msynth[osc]->last_amp);
+        } else {
+            synth[osc]->phase = phase;
+            msynth[osc]->loopstart = preset->loopstart;
+            msynth[osc]->loopend = preset->loopend;
+            // Copy the looping mode from the wave mode field.  Can be updated on note_off.
+            msynth[osc]->state = synth[osc]->mode;
+        }
+        // Make sure PCM waveforms are excluded from auto-termination, so we don't cut-off samples with silent gaps.  May be modified by note_off.
         synth[osc]->terminate_on_silence = 0;
     }
 }
@@ -206,20 +326,29 @@ void pcm_mod_trigger(uint16_t osc) {
 
 void pcm_note_off(uint16_t osc) {
     if(AMY_IS_SET(synth[osc]->preset)) {
-        uint32_t length = 0;
-        memorypcm_preset_t rom_local;
-        memorypcm_preset_t *preset =
-            get_preset_for_preset_number(synth[osc]->preset, &rom_local);
-        if(preset != NULL) {
-            length = preset->length;
-        }
-        if(msynth[osc]->feedback == 0) {
-            // Non-looping note: Set phase to the end to cause immediate stop.
-            synth[osc]->phase = F2P(length / (float)(1 << PCM_INDEX_BITS));
-        } else {
-            // Looping is requested, disable future looping, sample will play through to end.
+        if (msynth[osc]->state == PCM_PLAY_STOP
+            || msynth[osc]->state == PCM_LOOP_STOP) {
+            // PCM mode where note off causes immediate stop.
+            //
+            // This used to seek phase past the end of the sample and let
+            // render_pcm notice on the next block. That worked only for
+            // in-memory presets: a streamed one refills from the file and
+            // resets phase to 0 every block, so the seek was thrown away and
+            // the clip played on to end-of-file, ignoring note-off entirely.
+            // PCM_PLAY_STOP is the DEFAULT mode, so that hit every
+            // disk_sample() note-off. Stopping the osc says what we mean and
+            // works for both kinds -- and it no longer needs the preset
+            // lookup that the seek needed just to find the sample length.
+            synth[osc]->status = SYNTH_OFF;
+        } else if (msynth[osc]->state == PCM_LOOP_FOREVER) {
+            // Sending one note-off to a LOOP_FOREVER loop downgrades it to a stoppable loop.
+            msynth[osc]->state = PCM_LOOP;
+            // Allow the engine to terminate it when it goes to silence (e.g. from envelope).
+            synth[osc]->terminate_on_silence = 1;
+        } else if (msynth[osc]->state == PCM_LOOP || msynth[osc]->state == PCM_PLAY) {
+            // Looping was enabled but after stop we just play through to the end.
             // (sending a second note-off will stop it immediately).
-            msynth[osc]->feedback = 0;
+            msynth[osc]->state = PCM_PLAY_STOP;
         }
     }
 }
@@ -277,20 +406,39 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
         }
 
         SAMPLE amp = F2S(msynth[osc]->amp);
-        PHASOR step = F2P((playback_freq / (float)AMY_SAMPLE_RATE) / (float)(1 << PCM_INDEX_BITS));
+        PHASOR step = F2P((playback_freq / (float)AMY_SAMPLE_RATE) / (float)(1 << (PCM_INDEX_BITS - PCM_INDEX_STEP_EXTRA_BITS)));
         const LUTSAMPLE* table = preset->sample_ram;
-        uint32_t base_index = INT_OF_P(synth[osc]->phase, PCM_INDEX_BITS);
+        uint32_t base_index_base = INT_OF_P(synth[osc]->phase, PCM_INDEX_BITS);
+        uint32_t base_index = base_index_base;
+        PHASOR phase = (synth[osc]->phase - (base_index_base << PCM_INDEX_FRAC_BITS)) << PCM_INDEX_STEP_EXTRA_BITS;
         for(uint16_t i=0; i < AMY_BLOCK_SIZE; i++) {
-            SAMPLE frac = S_FRAC_OF_P(synth[osc]->phase, PCM_INDEX_BITS);
+            SAMPLE frac = S_FRAC_OF_P(phase, PCM_INDEX_BITS - PCM_INDEX_STEP_EXTRA_BITS);
             LUTSAMPLE b = 0;
             LUTSAMPLE c = 0;
             uint32_t next_index = base_index + 1;
-            if (base_index >= sample_length) {
-                if (preset->type != AMY_PCM_TYPE_FILE) {
-                    synth[osc]->status = SYNTH_OFF;
+            // For non-file samples, we have to check for end of sample/looping.
+            if(preset->type != AMY_PCM_TYPE_FILE) {
+                if ((msynth[osc]->state == PCM_LOOP
+                     || msynth[osc]->state == PCM_LOOP_ONCE_INTERNAL
+                     || msynth[osc]->state == PCM_LOOP_STOP
+                     || msynth[osc]->state == PCM_LOOP_FOREVER)
+                    && base_index >= msynth[osc]->loopend) { // loopend
+                    // still looping.  The state may be modified by pcm_note_off.
+                    // back to loopstart
+                    phase &= ((1L << (PCM_INDEX_FRAC_BITS + PCM_INDEX_STEP_EXTRA_BITS)) - 1);
+                    base_index_base = msynth[osc]->loopstart + (base_index - msynth[osc]->loopend);
+                    if (msynth[osc]->state == PCM_LOOP_ONCE_INTERNAL) {
+                        msynth[osc]->state = msynth[osc]->next_state;  // Only loops once.
+                        msynth[osc]->loopstart = preset->loopstart;
+                        msynth[osc]->loopend = preset->loopend;
+                    }
+                    //fprintf(stderr, "time %.3f sample %d LOOP: old_index %d new_index %d phase 0x%lx\n", amy_global.time, i, base_index, base_index_base, phase);
+                    base_index = base_index_base;
+                } else if(base_index >= sample_length) { // end
+                    synth[osc]->status = SYNTH_OFF;// is this right?
+                    buf[i] = 0;
+                    break;
                 }
-                buf[i] = 0;
-                continue;
             }
             if (preset->channels == 2) {
                 uint32_t base_offset = base_index * 2;
@@ -318,32 +466,17 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
                 c = (next_index < sample_length) ? table[next_index] : b;
             }
             SAMPLE sample = L2S(b) + MUL4_SS(L2S(c - b), frac);
-            synth[osc]->phase = P_WRAPPED_SUM(synth[osc]->phase, step);
-            base_index = INT_OF_P(synth[osc]->phase, PCM_INDEX_BITS);
-
-            if(preset->type != AMY_PCM_TYPE_FILE) {
-                // For non-file samples, we have to check for end of sample/looping.
-                if(base_index >= sample_length) { // end
-                    synth[osc]->status = SYNTH_OFF;// is this right?
-                    sample = 0;
-                } else {
-                    if(msynth[osc]->feedback > 0) { // still looping.  The feedback flag is cleared by pcm_note_off.
-                        if(base_index >= preset->loopend) { // loopend
-                            // back to loopstart
-                            int32_t loop_len = preset->loopend - preset->loopstart;
-                            synth[osc]->phase -= F2P(loop_len / (float)(1 << PCM_INDEX_BITS));
-                            base_index -= loop_len;
-                        }
-                    }
-                }
-            }
             SAMPLE value = buf[i] + MUL4_SS(amp, sample);
             buf[i] = value;   
             if (value < 0) value = -value;
             if (value > max_value) max_value = value;  
+            phase = P_WRAPPED_SUM(phase, step);
+            base_index = base_index_base + INT_OF_P(phase, PCM_INDEX_BITS - PCM_INDEX_STEP_EXTRA_BITS);
         }
-        //printf("render_pcm: osc %d preset %d len %d base_ix %d phase %f step %f tablestep %f amp %f\n",
-        //       osc, synth[osc]->preset, preset->length, base_index, P2F(synth[osc]->phase), P2F(step), (1 << PCM_INDEX_BITS) * P2F(step), S2F(msynth[osc]->amp));
+        //synth[osc]->phase = phase;
+        synth[osc]->phase = I2P(base_index, PCM_INDEX_BITS) + (S_FRAC_OF_P(phase, PCM_INDEX_BITS - PCM_INDEX_STEP_EXTRA_BITS) >> (S_FRAC_BITS - (PCM_INDEX_FRAC_BITS)) ); //  + PCM_INDEX_STEP_EXTRA_BITS
+        //fprintf(stderr, "\rtime %.3f osc %d render_pcm7: preset %d len %d base_ix 0x%lx phase 0x%lx sfracofp 0x%lx step 0x%lx synthphase 0x%lx amp %.3f\n",
+        //        amy_global.time, osc, synth[osc]->preset, preset->length, base_index, phase, S_FRAC_OF_P(phase, PCM_INDEX_BITS - PCM_INDEX_STEP_EXTRA_BITS) >> (S_FRAC_BITS - (PCM_INDEX_FRAC_BITS + PCM_INDEX_STEP_EXTRA_BITS)), step, synth[osc]->phase, S2F(msynth[osc]->amp));
         return max_value; 
         // i don't believe we ever need to detect silence in a sample. it will shut itself off at the end.
     }
@@ -426,7 +559,7 @@ int pcm_load_file() {
 // load mono samples (let python parse wave files) into preset # 
 // set loopstart, loopend, midinote, samplerate (and log2sr)
 // return the allocated sample ram that AMY will fill in.
-int16_t * pcm_load(uint16_t preset_number, uint32_t length, uint32_t samplerate, uint8_t channels, uint8_t midinote, uint32_t loopstart, uint32_t loopend) {
+int16_t * pcm_load(uint16_t preset_number, uint32_t length, uint32_t samplerate, uint8_t channels, float midinote, uint32_t loopstart, uint32_t loopend) {
     // if preset was already a memorypcm, we need to unload it
     pcm_unload_preset(preset_number); // this is a no-op if preset doesn't exist or is a const pcm
     // now alloc a new LL entry and preset (the old LL entry is removed with pcm_unload_preset)
