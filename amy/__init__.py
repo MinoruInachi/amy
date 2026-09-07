@@ -110,6 +110,21 @@ def reset_sysclock():
 # If set, calls this instead of amy.send()
 override_send = None
 
+# Bumped every time something goes out that destroys AMY's synth definitions.
+# AMY has no way to tell a host that this happened, and the host cannot infer
+# it: a Python object holding a synth number stays perfectly valid-looking
+# while the synth it names no longer exists, so notes sent to it are dropped
+# silently -- no error, no warning, just nothing. Hosts that keep such handles
+# (Tulip's synth.PatchSynth) compare this counter and rebuild when it moves.
+# See send() for what counts, and RESET_ALL_NOTES for stopping sound without
+# taking the synths with it.
+instrument_generation = 0
+
+# The reset bits that reach instruments_reset() inside amy_reset_oscs().
+# RESET_SYNTHS is a deprecated alias for RESET_ALL_OSCS and RESET_AMY restarts
+# everything, so all three land in the same place.
+_RESETS_INSTRUMENTS = RESET_ALL_OSCS | RESET_SYNTHS | RESET_AMY
+
 mess = []
 log = False
 
@@ -362,6 +377,15 @@ def stop_store_patch(patch):
 # Send an AMY message to amy
 def send(**kwargs):
     m = message(**kwargs)
+
+    # Every route that wipes AMY's synths from Python funnels through here --
+    # amy.reset(), a bare send(reset=...), and the amy.examples demos, which
+    # all open with send(reset=RESET_ALL_OSCS). One dict lookup per send is
+    # cheap next to building the wire string above.
+    reset_bits = kwargs.get('reset')
+    if reset_bits is not None and (reset_bits & _RESETS_INSTRUMENTS):
+        global instrument_generation
+        instrument_generation += 1
 
     send_raw(m)
 
