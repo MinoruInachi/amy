@@ -44,10 +44,16 @@ memorypcm_ll_t * memorypcm_ll_start;
 #ifdef GAMMA9001
 #include "pcm_gamma9001.h"
 // Set by the platform at boot: web links the drums.bin blob in and passes it,
-// ESP32-S3 passes the esp_partition_mmap'd partition. NULL = banks unavailable.
+// ESP32-S3 passes the esp_partition_mmap'd partition, the Tab5 reads it into
+// PSRAM. NULL = banks unavailable.
 const int16_t * gamma9001_pcm = NULL;
 void amy_set_gamma9001_pcm(const int16_t * data) {
     gamma9001_pcm = data;
+}
+// Lets a host size-check a drums.bin it loaded itself, without duplicating the
+// constant out of this generated header. See amy.h.
+uint32_t amy_gamma9001_bin_frames(void) {
+    return GAMMA9001_BIN_FRAMES;
 }
 #endif
 

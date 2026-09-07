@@ -105,10 +105,18 @@ extern const uint32_t pcm_wavetable_len;
 #ifdef GAMMA9001
 // The Gamma9001 drum banks: presets GAMMA9001_PRESET_BASE and up, resolved
 // from a raw int16 blob (drums.bin) that the platform provides at boot --
-// linked into the binary on web, mmapped from a flash partition on ESP32-S3.
+// linked into the binary on web, mmapped from a flash partition on ESP32-S3,
+// read into PSRAM from a file on the Tab5.
 // Until the pointer is set those presets are silently unavailable.
 extern const int16_t * gamma9001_pcm;
 extern void amy_set_gamma9001_pcm(const int16_t * data);
+// How many int16 frames the blob must hold for gamma9001_map to index it
+// safely. A host that loads drums.bin at runtime -- rather than linking or
+// mmapping something already the right size -- needs this to check the file
+// before handing it over. Exposed as a function because the constant lives in
+// the generated pcm_gamma9001.h, which also defines gamma9001_map[] and so
+// cannot be included a second time.
+extern uint32_t amy_gamma9001_bin_frames(void);
 #endif
 
 // File-streaming buffer size multiplier (in blocks).
