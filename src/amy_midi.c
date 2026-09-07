@@ -2,7 +2,11 @@
 // i deal with parsing and receiving midi on many platforms
 
 #include "amy.h"
-#if defined(TULIP) || defined(AMYBOARD)
+// TAB5 is here for mp_sched_schedule() in parse_sysex()'s deferred branch. It
+// does NOT take the mp_usbd_task() path further down: that drains the USB
+// *gadget* FIFO, and this board's MIDI is USB host with amy_config.midi =
+// AMY_MIDI_IS_NONE, so the extern below is simply unused there.
+#if defined(TULIP) || defined(AMYBOARD) || defined(TAB5)
 #include "py/runtime.h"
 // Forward-declare to avoid including the shared tinyusb header path. Defined
 // in micropython/shared/tinyusb/mp_usbd_runtime.c and safe to call from the MP
@@ -314,7 +318,7 @@ void midi_clock_received() {
 */
 
 uint16_t sysex_len = 0;
-#if defined(TULIP) || defined(AMYBOARD)
+#if defined(TULIP) || defined(AMYBOARD) || defined(TAB5)
 extern const mp_obj_fun_builtin_var_t tulip_amy_send_sysex_obj;
 #endif
 uint8_t * sysex_buffer = NULL;
@@ -360,7 +364,11 @@ void parse_sysex() {
             // underlying MP resources. So we schedule it to run in the MP main loop instead.
             // Each message gets its own ring-buffer slot so a fast-arriving next sysex
             // doesn't overwrite an unprocessed message.
-            #if defined(TULIP) || defined(AMYBOARD)
+            // TAB5 joins them: its sysex arrives on the USB host task, and it
+            // installs the MicroPython file hooks, which reach mp_vfs_open() and
+            // the MP heap. Dispatching inline there would corrupt them. It has
+            // copy slots (amy_midi.h) so deferring keeps the message.
+            #if defined(TULIP) || defined(AMYBOARD) || defined(TAB5)
             {
                 // NOTE: ACK is sent from the callback (tulip_amy_send_sysex)
                 // AFTER the message is processed, not here in parse_sysex.

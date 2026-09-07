@@ -55,9 +55,10 @@ extern uint8_t *sysex_buffer;
 // Every platform allocates the single sysex_buffer above. The sysex copy-slot
 // ring buffer below holds backup snapshots so a fast-arriving message isn't lost
 // while a previous one waits for the deferred MicroPython mp_sched callback.
-// Only AMYBOARD creates and reads these slots (see parse_sysex()): the ring
+// AMYBOARD and TAB5 create and read these slots (see parse_sysex()): the ring
 // exists for the SPSS z* sketch-transfer bursts over USB-gadget MIDI, which
-// only AMYboard receives. Size the ring to 0 everywhere else so we don't
+// AMYboard receives over its gadget port and the Tab5 over its USB-A host
+// port. Size the ring to 0 everywhere else so we don't
 // malloc SYSEX_COPY_SLOTS x MAX_SYSEX_BYTES: that alone would exhaust e.g.
 // the rp2350's 520KB of SRAM, and on Tulip ESP32-S3 it ate a third of the
 // free SPIRAM. With 0 slots, parse_sysex() finds a NULL slot and the
@@ -67,7 +68,15 @@ extern uint8_t *sysex_buffer;
 // (the ACK is sent only after a slot is drained, see parse_sysex()), so it
 // can never run more than the ring depth ahead. 32 slots cost 512KB of
 // SPIRAM better spent on memorypcm samples.
-#if defined(AMYBOARD)
+//
+// TAB5 takes the same 8: it needs slots for a different reason than AMYboard's
+// burst rate. Its sysex arrives on the USB host task, and the MicroPython file
+// hooks it installs (fopen/fread/... -> mp_vfs_open) may only run on the MP
+// thread, so its dispatch has to defer like TULIP's. Deferring with 0 slots is
+// what drops the message, so on this board the ring is what makes sysex work at
+// all, not just what keeps it from being overwritten. It comes out of 32MB of
+// PSRAM here (ram_caps_sysex), not the S3's much tighter budget.
+#if defined(AMYBOARD) || defined(TAB5)
 #define SYSEX_COPY_SLOTS 8
 #else
 #define SYSEX_COPY_SLOTS 0
