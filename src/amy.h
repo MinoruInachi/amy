@@ -72,14 +72,22 @@ extern const uint32_t pcm_wavetable_len;
 
 
 
-// Set block size and SR. We try for 256/44100, but some platforms don't let us:
+// Set block size and SR. We try for 256/44100, but some platforms don't let us.
+// The block is a POWER OF TWO -- the per-block amplitude and pan ramps are
+// SHIFTR(delta, BLOCK_SIZE_BITS), not a divide -- so a host chooses it in
+// BITS, at compile time: -DBLOCK_SIZE_BITS=7 is a 128-sample block, 6 is 64.
+// Left alone it is 8 (256 samples), or 7 (128) on Daisy, exactly as before.
+#ifndef BLOCK_SIZE_BITS
 #ifdef AMY_DAISY
-#define AMY_BLOCK_SIZE 128
-#define BLOCK_SIZE_BITS 7 // log2 of BLOCK_SIZE
+#define BLOCK_SIZE_BITS 7
 #else
-#define AMY_BLOCK_SIZE 256
-#define BLOCK_SIZE_BITS 8 // log2 of BLOCK_SIZE
+#define BLOCK_SIZE_BITS 8
 #endif
+#endif
+#if BLOCK_SIZE_BITS < 5 || BLOCK_SIZE_BITS > 10
+#error "BLOCK_SIZE_BITS must be 5..10 (a block of 32..1024 samples)"
+#endif
+#define AMY_BLOCK_SIZE (1 << BLOCK_SIZE_BITS)
 
 #ifdef AMY_DAISY
 #define AMY_SAMPLE_RATE 48000
@@ -308,6 +316,13 @@ enum coefs{
 #define FILTER_LPF24 4
 #define FILTER_NOTCH 5
 #define FILTER_PHASER 6
+// synth[].dist.stages bits - each stage toggles independently and enabled
+// stages stack in clip -> fold -> crush order.
+#define DIST_CLIP 1
+#define DIST_FOLD 2
+#define DIST_CRUSH 4
+// Pre-gain ceiling, = 2^MAX_DIST_LOGDRIVE: the top of the drive coef rail.
+#define DIST_MAX_DRIVE 16.0f
 // synth[].wave values
 #define SINE 0
 #define PULSE 1
@@ -433,8 +448,16 @@ enum params{
     // One id, not one per bus: like every other bus-directed param (EQ_*,
     // ECHO_*, REVERB_*), a VOLUME delta names its bus in delta.osc.  It used
     // to be VOLUME_BASE..VOLUME_BASE+n, which is what capped the bus count --
-    // the ids would have run into MODE below.  72..98 are now free.
+    // the ids would have run into MODE below.  77..98 are now free.
     VOLUME,                              // 71
+    // Per-osc distortion stage (see dist_process); one enable per stage.
+    // Drive and mix are modulatable, so each claims a full coef vector out
+    // of the free block; 97..98 remain.
+    DIST_CLIP_EN,                        // 72
+    DIST_FOLD_EN, DIST_CRUSH_EN,         // 73, 74
+    DIST_BITS, DIST_RATE,                // 75, 76
+    DIST_LOGDRIVE,                       // 77..86
+    DIST_MIX=DIST_LOGDRIVE + NUM_COMBO_COEFS,  // 87..96
     MODE=99,                             // 99
     ALGO_SOURCE_START=100,               // 100..105
     ALGO_SOURCE_END=100+MAX_ALGO_OPS,    // 106
@@ -458,7 +481,19 @@ enum params{
     REVERB_LIVENESS,
     REVERB_DAMPING,
     REVERB_XOVER_HZ,
+    // Per-bus distortion stage; bus in delta.osc like the params above.
+    // Same per-stage enables as the per-osc stage, and the same event fields
+    // feed both - which of the two an event reaches is its own scope, but the
+    // deltas stay distinct because their targets are.  Drive and mix are
+    // scalar here: a bus has no per-note modulation sources.
+    BUS_DIST_CLIP_EN,
+    BUS_DIST_FOLD_EN, BUS_DIST_CRUSH_EN,
+    BUS_DIST_DRIVE, BUS_DIST_BITS,
+    BUS_DIST_RATE, BUS_DIST_MIX,
     BUS,
+    SAMPLE_OFFSET,              // PCM note-on start offset in samples within its block
+    FIT,                        // PCM time-stretch/pitch-shift target in sequencer ticks
+    FIT_SEARCH,                 // PCM fit engine: WSOLA correlation search half-width, in frames
     NO_PARAM                    // 210
 };
 // Before there were two mod sources there was just MOD_SOURCE; it names slot 0.
@@ -471,7 +506,7 @@ enum params{
       
 enum itags{
     RENDER_OSC_WAVE, COMPUTE_BREAKPOINT_SCALE, HOLD_AND_MODIFY, FILTER_PROCESS, FILTER_PROCESS_STAGE0,
-    FILTER_PROCESS_STAGE1, ADD_DELTA_TO_QUEUE, AMY_ADD_DELTA, PLAY_DELTA,  MIX_WITH_PAN, AMY_RENDER, 
+    FILTER_PROCESS_STAGE1, DIST_PROCESS, ADD_DELTA_TO_QUEUE, AMY_ADD_DELTA, PLAY_DELTA,  MIX_WITH_PAN, AMY_RENDER, 
     AMY_EXECUTE_DELTAS, AMY_FILL_BUFFER, RENDER_LUT_FM, RENDER_LUT_FB, RENDER_LUT, 
     RENDER_LUT_CUB, RENDER_LUT_FM_FB, RENDER_LPF_LUT, DSPS_BIQUAD_F32_ANSI_SPLIT_FB, DSPS_BIQUAD_F32_ANSI_SPLIT_FB_TWICE, DSPS_BIQUAD_F32_ANSI_COMMUTED, 
     PARAMETRIC_EQ_PROCESS, HPF_BUF, SCAN_MAX, DSPS_BIQUAD_F32_ANSI, BLOCK_NORM, CALIBRATE, AMY_ESP_FILL_BUFFER, NO_TAG
@@ -595,6 +630,9 @@ typedef struct amy_event {
     float feedback;
     float velocity;
     float trigger_phase;
+    uint16_t sample_offset;  // PCM: start this note-on at a sample offset within its block (0..AMY_BLOCK_SIZE-1)
+    float fit_ticks;  // PCM: >0 = time-stretch to this many sequencer ticks; 0 = pitch-shift at original length; <0 = off
+    uint16_t fit_search;  // PCM fit engine: grain alignment search half-width in frames (0 = off, unset = PCM_STRETCH_SEARCH)
     float volume;  // event_only; the mixdown volume of `bus` (default bus 0)
     float pitch_bend;  // event_only
     float tempo;  // event_only
@@ -606,6 +644,23 @@ typedef struct amy_event {
     uint16_t mod_source[NUM_MOD_SOURCES];
     uint8_t algorithm;
     uint8_t filter_type;
+    // Distortion ('G' distortion sub-commands on the wire).  One enable per
+    // stage, so an event can toggle one stage without naming the others.
+    // Scope comes from the event, not from the field: an event that names an
+    // osc shapes that osc, one that names none shapes the bus it addresses
+    // (bus=, else the synth's bus, else AMY_DEFAULT_BUS) - the rule
+    // event_addresses_bus()/event_addresses_oscs() apply.  A bus has no
+    // per-note modulation sources, so at bus scope only the CONST coef of
+    // dist_drive_coefs/dist_mix_coefs is read.
+    uint8_t dist_clip;
+    uint8_t dist_fold;
+    uint8_t dist_crush;
+    uint8_t dist_bits;
+    uint16_t dist_rate;
+    // Like freq_coefs, the CONST coef is in the natural unit -- linear drive,
+    // 1 = unity -- and the modulation coefs are octaves of it.
+    float dist_drive_coefs[NUM_COMBO_COEFS];
+    float dist_mix_coefs[NUM_COMBO_COEFS];
     float eq_l;  // not in synth
     float eq_m;  // not in synth
     float eq_h;  // not in synth
@@ -649,6 +704,49 @@ typedef struct amy_event {
     float reverb_xover_hz;
 } amy_event;
 
+// Distortion stage.  Split from synthinfo so the same shaper can run at any
+// summing scope: per-osc (timbral, inside the envelope/filter chain) and, on a
+// chained-osc head, per-voice.  Config is what the caller sets; state is what
+// DIST_CRUSH carries between blocks - its sample-and-hold plus the DC blocker
+// that follows it - and each independent signal path needs its own.
+typedef struct dist_config {
+    uint8_t stages;  // DIST_ stage bits; 0 = no stage enabled, distortion bypassed.
+    float drive;     // Pre-gain, 2^-4..2^4 (fold depth for DIST_FOLD), shared.
+    uint8_t bits;    // DIST_CRUSH bit depth; >= 24 disables quantization.
+    uint16_t rate;   // DIST_CRUSH sample-hold length in samples; 1 disables.
+    float mix;       // Wet/dry per pass, 0..1, shared.
+} dist_config_t;
+
+typedef struct dist_state {
+    SAMPLE hold;          // DIST_CRUSH held sample,
+    uint16_t hold_count;  // and samples left to hold it.
+    SAMPLE hpf_yn1;       // Wet-path DC blocker output (dist_block()).
+} dist_state_t;
+
+// Real-time granular time-stretch / pitch-shift state for PCM oscs ("fit",
+// see pcm.c).  Two overlapping Hann-windowed grains; the input read position
+// advances at a rate decoupled from the per-grain (pitch) read step, so
+// duration and pitch are independent.  All fixed point: positions are Q16
+// sample-frame indices (32.16 for the input timeline).
+#define PCM_STRETCH_GRAINS 2
+#define PCM_STRETCH_GRAIN 1024   // grain length in output samples
+#define PCM_STRETCH_HOP (PCM_STRETCH_GRAIN / 2)  // 50% overlap: Hann sums to 1
+typedef struct {
+    uint8_t active;         // fit engaged for the current note
+    uint8_t ended;          // input exhausted, no more grains will spawn
+    uint16_t hop_counter;   // output samples until the next grain spawn
+    uint64_t in_pos_q16;    // input timeline: frame index of the next grain, Q16
+    uint32_t hop_advance_q16;  // input frames the timeline advances per hop, Q16
+    uint32_t us_per_tick_ref;  // us_per_tick hop_advance was computed against;
+                               // 0 when the note is not tempo-locked (fit=0)
+    struct {
+        uint8_t active;
+        uint16_t win_pos;       // 0..PCM_STRETCH_GRAIN-1, position in window
+        uint32_t start_frame;   // input frame where this grain began
+        uint32_t phase_q16;     // frames advanced since start_frame, Q16
+    } grain[PCM_STRETCH_GRAINS];
+} pcm_stretch_t;
+
 // This is the state of each oscillator, set by the sequencer from deltas
 struct synthinfo {
     uint16_t osc; // self-reference
@@ -667,10 +765,22 @@ struct synthinfo {
     float pan_coefs[NUM_COMBO_COEFS];
     float feedback;
     float trigger_phase;
+    uint16_t sample_offset;  // PCM note-on start offset in samples within its block
+    float fit_ticks;  // PCM fit target in sequencer ticks (0 = pitch-shift at original length)
+    uint16_t fit_search;  // PCM fit grain alignment search half-width in frames (0 = off)
     float logratio;
     float portamento_alpha;
     float resonance;
     uint8_t filter_type;
+    // Distortion, applied pre-filter.  On a normal osc this is the per-osc
+    // timbral stage; on a SILENT chained-osc head it shapes the summed voice.
+    // Drive and mix are combined per block into msynth, so what an osc stores
+    // is the authored coef vectors, not a ready-made dist_config_t.
+    uint8_t dist_stages;
+    uint8_t dist_bits;
+    uint16_t dist_rate;
+    float dist_logdrive_coefs[NUM_COMBO_COEFS];
+    float dist_mix_coefs[NUM_COMBO_COEFS];
     uint16_t chained_osc;
     uint16_t mod_source[NUM_MOD_SOURCES];
     uint8_t algorithm;
@@ -697,6 +807,10 @@ struct synthinfo {
     SAMPLE filter_delay[2 * FILT_NUM_DELAYS];
     // The block-floating-point shift of the filter delay values.
     int last_filt_norm_bits;
+    // DIST_CRUSH sample-rate reducer state.
+    dist_state_t dist_state;
+    // Granular time-stretch/pitch-shift state (PCM "fit", see pcm.c).
+    pcm_stretch_t stretch;
 };
 
 // synthinfo, but only the things that mods/env can change. one per osc
@@ -713,10 +827,13 @@ struct mod_synthinfo {
     float last_filter_logfreq;  // filter freq history for smoothing.
     float resonance;
     float feedback;
+    float dist_drive;   // Combined per block; dist_block reads it once.
+    float dist_mix;
     uint16_t state;      // Used for PCM looping state.
     uint16_t next_state; // Used for PCM looping state.
     uint32_t loopstart;  // Used for PCM looping.
     uint32_t loopend;    // Used for PCM looping.
+    uint16_t pcm_delay;  // Samples of silence to leave at the head of the note-on block (sample_offset).
 };
 
 
@@ -904,6 +1021,10 @@ typedef struct bus_state {
     reverb_state_t reverb;
     chorus_config_t chorus;
     echo_config_t echo;
+    // Distortion, first in the bus FX chain; per-channel state per
+    // dist_block's contract.
+    dist_config_t dist;
+    dist_state_t dist_state[AMY_MAX_CHANNELS];
 } bus_state_t;
 
 // global synth state
@@ -991,7 +1112,14 @@ void amy_release_lock();
 void amy_deltas_reset();
 void add_delta_to_queue(struct delta *d, struct delta **queue);
 void amy_add_event_internal(amy_event *e, uint16_t base_osc);
-void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, struct delta **queue);
+// True if a voice-relative osc number lands inside a voice of oscs_per_voice
+// oscs; otherwise prints what was out of range and returns false. An
+// oscs_per_voice of 0 means there is no voice context and nothing is checked.
+bool osc_ref_within_voice(int rel_osc, uint16_t oscs_per_voice, const char *what);
+
+// oscs_per_voice bounds any osc reference in the event to the voice being
+// configured (0 = no voice context, no bound). See osc_ref_within_voice().
+void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, uint16_t oscs_per_voice, struct delta **queue);
 int web_audio_buffer(float *samples, int length);
 void amy_render(uint16_t start, uint16_t end, uint8_t core);
 void print_osc_debug(uint16_t i /* osc */, bool show_eg);
@@ -1002,6 +1130,8 @@ float logfreq_for_midi_note(float midi_note);
 float midi_note_for_logfreq(float logfreq);
 float logfreq_of_freq(float freq);
 float freq_of_logfreq(float logfreq);
+float logdrive_of_drive(float drive);
+float drive_of_logdrive(float logdrive);
 float portamento_ms_to_alpha(uint16_t portamento_ms);
 uint16_t alpha_to_portamento_ms(float alpha);
 int8_t check_init(amy_err_t (*fn)(), const char *name);
@@ -1109,6 +1239,26 @@ void amy_bleep_synth(uint32_t start);
 void amy_restart();
 void amy_reset_oscs();
 void amy_print_devices();
+
+// ---- Which audio device ---------------------------------------------
+//
+// config.playback_device_id / capture_device_id are INDICES into
+// miniaudio's enumeration, and amy_print_devices() has been the only way
+// to see that list -- fine for a command line, no use to a host with a
+// menu or a settings pane to fill in. These name it.
+//
+// The order is exactly the one those two ids index, so a host can list
+// the names, take a pick, and store the index straight into the config.
+// Answers 0 on a platform whose audio is not miniaudio (the ESP32, the
+// Pico, Arduino), so a host may call them unconditionally.
+#define AMY_AUDIO_DEVICE_OUT 0
+#define AMY_AUDIO_DEVICE_IN  1
+
+uint32_t amy_audio_device_count(uint8_t dir);
+// The device name, into buf. Returns the length written, or 0 for an
+// index that is out of range -- in which case buf is left holding an
+// empty string, so a caller may skip the check.
+uint32_t amy_audio_device_name(uint8_t dir, uint32_t index, char *buf, uint32_t buflen);
 void amy_set_custom(struct custom_oscillator* custom);
 void amy_reset_sysclock();
 
@@ -1319,6 +1469,10 @@ extern void pcm_unload_all_presets();
 extern void filters_init(uint16_t bus);
 extern void filters_deinit(uint16_t bus);
 extern SAMPLE filter_process(SAMPLE * block, uint16_t osc, SAMPLE max_value);
+extern SAMPLE dist_block(SAMPLE * block, uint16_t len,
+                         const dist_config_t *cfg, dist_state_t *st);
+extern SAMPLE dist_process(SAMPLE * block, uint16_t osc);
+extern void dist_process_bus(uint16_t bus, SAMPLE *busbuf);
 extern void parametric_eq_process(uint16_t bus, SAMPLE *block);
 extern void reset_filter(uint16_t osc);
 extern void reset_parametric(uint16_t bus);

@@ -476,6 +476,44 @@ int amy_parse_synth_layer_message(char *message, amy_event *e) {
     return skip_chars;
 }
 
+// Parser for the 'G' prefix: a digit is filter_type as ever; a letter is a
+// distortion sub-command. GC<v> and GF<v> enable clip and fold (0 turns the
+// stage off), GH<bits>[,<rate>] enables the bitcrusher (GH0 turns it off),
+// GD<coefs> and GM<coefs> carry the drive and wet/dry coef vectors shared by
+// every stage - a single value sets just the constant term, so scalar use
+// reads as before.  Stages are independent: enabled stages stack in
+// clip -> fold -> crush order, and each command touches only its own stage.
+// The commands say what to do, not where: an event carrying a 'v' shapes that
+// osc, one without shapes the bus the event addresses ('y', else the synth's
+// bus, else the default).  At bus scope only the constant term of GD/GM is
+// used, since a bus sum has no per-note modulation sources to combine.
+int amy_parse_dist_layer_message(char *message, amy_event *e) {
+    if (message[0] >= '0' && message[0] <= '9') {
+        // It's just the filter type.
+        e->filter_type = atoi(message);
+        return 0;  // no extra skip.
+    }
+    char cmd = message[0];
+    message++;
+    if (cmd == 'C')  e->dist_clip = (atoff(message) != 0);
+    else if (cmd == 'F')  e->dist_fold = (atoff(message) != 0);
+    else if (cmd == 'H') {
+        uint16_t vals[2];
+        parse_list_uint16_t(message, vals, 2, AMY_UNSET_VALUE(vals[0]));
+        if (vals[0] == 0) {
+            e->dist_crush = 0;
+        } else {
+            e->dist_crush = 1;
+            if (AMY_IS_SET(vals[0])) e->dist_bits = (uint8_t)MIN(vals[0], 24);
+            if (AMY_IS_SET(vals[1])) e->dist_rate = vals[1];
+        }
+    }
+    else if (cmd == 'D')  parse_coef_message(message, e->dist_drive_coefs);
+    else if (cmd == 'M')  parse_coef_message(message, e->dist_mix_coefs);
+    else fprintf(stderr, "Unrecognized distortion command '%s'\n", message - 1);
+    return 1;  // skip the sub-command letter.
+}
+
 // Parse a sample-load parameter list ('z'/'zS' messages): comma-separated
 // unsigned integers, except the midinote field which may be fractional (e.g.
 // a sample tuned 4 cents sharp of C4 is "60.04"). parse_list_uint32_t cannot
@@ -727,7 +765,7 @@ int amy_parse_message(char * message, amy_event *e) {
             case 'D': show_debug(atoi(arg)); break;
             case 'f': parse_coef_message(arg, e->freq_coefs);break;
             case 'F': parse_coef_message(arg, e->filter_freq_coefs); break;
-            case 'G': e->filter_type = atoi(arg); break;
+            case 'G': pos += amy_parse_dist_layer_message(arg, e); break;  // Skip over second cmd letter, if any.
             /* g used for Alles for client # */
             // 'H' is the ticks= schedule command, it's caught in amy_add_message before this.
             //case 'H': parse_list_uint32_t(arg, e->ticks, 3, 0); break;
@@ -773,7 +811,24 @@ int amy_parse_message(char * message, amy_event *e) {
             case 'N': e->latency_ms = atoi(arg);  break;
             case 'o': e->algorithm=atoi(arg); break;
             case 'O': parse_algo_source(arg, e->algo_source); break;
-            case 'p': e->preset=atoi(arg); break;
+            case 'p':
+                // 'p' is the preset/sampler layer: a bare number is the preset,
+                // a sub-letter addresses a PCM param.  Sampler params live here
+                // rather than at the top level because single letters are nearly
+                // exhausted (44 of 52 allocated) and this corner keeps growing.
+                if (arg[0] == 'o') {  // 'po' is PCM sample_offset.
+                    e->sample_offset = atoi(arg + 1);
+                    ++pos;
+                } else if (arg[0] == 'F') {  // 'pF' is PCM fit (ticks).
+                    e->fit_ticks = atoff(arg + 1);
+                    ++pos;
+                } else if (arg[0] == 'S') {  // 'pS' is PCM fit grain search half-width.
+                    e->fit_search = atoi(arg + 1);
+                    ++pos;
+                } else {
+                    e->preset = atoi(arg);
+                }
+                break;
             case 'P': e->trigger_phase=atoff(arg); break;
             /* q unused */
             case 'Q': parse_coef_message(arg, e->pan_coefs); break;
@@ -830,7 +885,6 @@ int amy_parse_message(char * message, amy_event *e) {
                 }
                 break;
             case 'y': e->bus = atoi(arg); break;
-            /* Y still available */
             case 'z': {
                 pos += amy_parse_transfer_layer_message(arg);
                 break;
