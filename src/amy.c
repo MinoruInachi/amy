@@ -134,6 +134,7 @@ void amy_init_lock() {
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_rom_sys.h"
 SemaphoreHandle_t amy_queue_lock;
 
 void amy_grab_lock() {
@@ -155,6 +156,20 @@ void amy_init_lock() {
 }
 
 #endif
+
+// A short pause (~100us) for a thread waiting on the renderer, see
+// flush_due_deltas(). Platforms without threads never wait.
+static void amy_wait_briefly() {
+#if defined __EMSCRIPTEN__
+    for (volatile int i = 0; i < 1000; ++i) { }
+#elif defined _WIN32
+    Sleep(1);
+#elif defined _POSIX_THREADS
+    usleep(100);
+#elif defined ESP_PLATFORM
+    esp_rom_delay_us(100);
+#endif
+}
 
 
 
@@ -2316,8 +2331,28 @@ SAMPLE render_osc_wave(uint16_t osc, uint8_t core, SAMPLE* buf) {
     return max_val;
 }
 
+// How many amy_render() calls are in flight, on any core; guarded by the
+// queue lock. play_delta() can free or reallocate an osc's storage (FREE_OSC,
+// a reset of all oscs, breakpoint growth) and the renderer reads synth[]
+// without the lock, so a thread that plays deltas outside the rendering
+// context waits for this to reach zero first (see flush_due_deltas()).
+static int amy_renders_in_flight = 0;
+
+static void amy_render_begin() {
+    amy_grab_lock();
+    amy_renders_in_flight++;
+    amy_release_lock();
+}
+
+static void amy_render_end() {
+    amy_grab_lock();
+    amy_renders_in_flight--;
+    amy_release_lock();
+}
+
 AMY_IRAM_ATTR void amy_render(uint16_t start, uint16_t end, uint8_t core) {
     AMY_PROFILE_START(AMY_RENDER)
+    amy_render_begin();
 
     for(int bus = 0; bus <= amy_global.highest_bus; ++bus)
         bzero(fbl[core][bus], sizeof(SAMPLE) * AMY_BLOCK_SIZE * AMY_NCHANS); 
@@ -2392,6 +2427,7 @@ AMY_IRAM_ATTR void amy_render(uint16_t start, uint16_t end, uint8_t core) {
         fprintf(stderr, "time %" PRIu32 " core %d bus 0 max_max=%.3f post-eq max=%.3f\n", amy_global.total_samples, core, S2F(max_max), S2F(smax));
     }
 
+    amy_render_end();
     AMY_PROFILE_STOP(AMY_RENDER)
 
 }
@@ -2403,10 +2439,28 @@ AMY_IRAM_ATTR void amy_render(uint16_t start, uint16_t end, uint8_t core) {
 // service is rendering-context-only (unguarded RMW on next_amy_tick_us, and
 // the external hook expects audio-thread context). Everything here is under
 // the queue lock - safe from any thread.
+// Longest a flush waits for a render in flight, in amy_wait_briefly() steps
+// (~50 ms). Bounded so a delta played from inside a render hook cannot wait
+// on its own render forever.
+#define AMY_FLUSH_WAIT_MAX_STEPS 500
+
 static void flush_due_deltas() {
     // check to see which sounds to play
     uint32_t sysclock = amy_sysclock();
     amy_grab_lock();
+
+    // Deltas can free osc storage that a render in progress on another thread
+    // is reading: a synth reloaded from the sending thread while its notes
+    // still sound runs the released voices' FREE_OSCs here, under the
+    // renderer, which then faults on synth[osc] == NULL. Let in-flight
+    // renders finish first; holding the lock keeps new ones from starting
+    // until the deltas are played. On the render thread itself nothing is in
+    // flight, so this costs one compare.
+    for (int waited = 0; amy_renders_in_flight > 0 && waited < AMY_FLUSH_WAIT_MAX_STEPS; ++waited) {
+        amy_release_lock();
+        amy_wait_briefly();
+        amy_grab_lock();
+    }
 
     // find any deltas that need to be played from the (in-order) queue
     struct delta *d = amy_global.delta_queue;
