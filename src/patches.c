@@ -1104,6 +1104,17 @@ uint8_t patches_voices_for_note_onoff_event(amy_event *e, uint16_t voices[], uin
     // Identify the specific voice (or voices) for a note on/off event.
     // e->velocity is assumed to be set when this function is called.
     int num_voices = 0;
+    // All-notes-off is a velocity 0 with no note -- or with note 0, which is how
+    // amy_received_all_notes_off() (MIDI CC 123) and Tulip's
+    // synth.all_notes_off() spell it. Note 0 used to take the single-note path
+    // below, where instrument_voice_for_note_event() marked every voice of the
+    // instrument idle and then reported "no voice": the voices never got their
+    // note-off, so the notes rang on, and no later note-off could find them.
+    if (AMY_IS_SET(e->midi_note) && AMY_IS_UNSET(e->preset) && e->velocity == 0
+        && (int)roundf(e->midi_note) == 0) {
+        // Unset, so the voices are released where they are rather than sent to note 0.
+        AMY_UNSET(e->midi_note);
+    }
     if (AMY_IS_UNSET(e->midi_note) && AMY_IS_UNSET(e->preset) && instrument_get_num_voices(e->synth, NULL) != 1) {
         // velocity without midi_note is valid for velocity==0 => all-notes-off.
         if (e->velocity != 0) {

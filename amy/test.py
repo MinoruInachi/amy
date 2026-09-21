@@ -351,6 +351,19 @@ class TestBYOPNoteOff(AmyTest):
     amy_send_at(time=700, synth=1, vel=0)
 
 
+class TestAllNotesOffNoteZero(AmyTest):
+
+  def run(self):
+    # All-notes-off spelled note=0, vel=0 -- what MIDI CC 123 and Tulip's
+    # synth.all_notes_off() send -- marked the synth's voices idle without
+    # sending them a note-off, so a held chord rang on for good.  It has to
+    # match vel=0 with no note: silence after the release.
+    amy_send_at(time=0, synth=1, num_voices=4, patch=0)
+    for note in (60, 64, 67):
+      amy_send_at(time=100, synth=1, note=note, vel=1)
+    amy_send_at(time=500, synth=1, note=0, vel=0)
+
+
 class TestInterpPartials(AmyTest):
 
   def run(self):
