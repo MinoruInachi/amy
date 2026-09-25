@@ -369,6 +369,8 @@ void config_chorus(uint16_t bus, float level, uint16_t max_delay, float lfo_freq
     // nonzero level as "chorus is on".
     if (level < 0) level = 0;
     if (AMY_IS_UNSET(max_delay)) max_delay = amy_global.bus[bus]->chorus.max_delay;
+    // The sweep spans 0..max_delay samples, so it must fit in the delay line.
+    if (max_delay > DELAY_LINE_LEN) max_delay = DELAY_LINE_LEN;
     if (AMY_IS_UNSET(lfo_freq)) lfo_freq = amy_global.bus[bus]->chorus.lfo_freq;
     if (AMY_IS_UNSET(depth)) depth = amy_global.bus[bus]->chorus.depth;
     //fprintf(stderr, "config_chorus: osc %d level %.3f max_del %d lfo_freq %.3f depth %.3f\n",
@@ -383,7 +385,7 @@ void config_chorus(uint16_t bus, float level, uint16_t max_delay, float lfo_freq
             amy_global.bus[bus]->chorus.level = 0;
             return;
         }
-        // apply max_delay.
+        // Center the sweep on max_delay / 2.
         for (int chan=0; chan<AMY_NCHANS; ++chan) {
             //chorus_delay_lines[chan]->max_delay = max_delay;
             amy_global.bus[bus]->chorus.chorus_delay_lines[chan]->fixed_delay = (int)max_delay / 2;
@@ -1176,6 +1178,7 @@ void amy_reset_oscs() {
     midi_active_channels_reset();
     cv_trigger_deinit();
     cv_trigger_init();
+    note_output_reset();
     cv_from_osc_deinit();
     cv_from_osc_init();
 }
@@ -1457,6 +1460,7 @@ void show_debug(uint8_t type) {
 
 void oscs_deinit() {
     cv_from_osc_deinit();
+    note_output_reset();
     cv_trigger_deinit();
     midi_mappings_deinit();
     for (int bus = 0; bus < amy_global.config.max_buses; ++bus) {
@@ -1516,7 +1520,6 @@ void osc_note_on(uint16_t osc, float initial_freq) {
     case AUDIO_IN1: audio_in_note_on(osc, 1); break;
     case AUDIO_EXT0: external_audio_in_note_on(osc, 0); break;
     case AUDIO_EXT1: external_audio_in_note_on(osc, 1); break;
-    case AMY_MIDI: amy_send_midi_note_on(osc); break;
     case BYO_PARTIALS: if(AMY_HAS_PARTIALS) partials_note_on(osc); break;
     case INTERP_PARTIALS: if(AMY_HAS_PARTIALS) interp_partials_note_on(osc); break;
     #ifdef AMY_WAVETABLE
@@ -1670,7 +1673,13 @@ void play_delta(struct delta *d) {
     DELTA_TO_SYNTH_F(FEEDBACK, feedback)
     DELTA_TO_SYNTH_F(RATIO, logratio)
     DELTA_TO_SYNTH_F(RESONANCE, resonance)
-    DELTA_TO_SYNTH_I(FILTER_TYPE, filter_type)
+    if (d->param == FILTER_TYPE) {
+        // The kernels store different things in filter_delay (raw vs b0-scaled input
+        // history, the phaser's allpass chain), so another type's state rings the
+        // new filter.  Restart from rest on a type change.
+        if (synth[d->osc]->filter_type != d->data.i) reset_filter(d->osc);
+        synth[d->osc]->filter_type = d->data.i;
+    }
     if (d->param == DIST_CLIP_EN) {
         if (d->data.i) synth[d->osc]->dist_stages |= DIST_CLIP;
         else           synth[d->osc]->dist_stages &= ~DIST_CLIP;
@@ -2002,7 +2011,6 @@ void play_delta(struct delta *d) {
                     switch(synth[osc]->wave) {
                     case KS: ks_note_off(osc); break;
                     case ALGO: algo_note_off(osc); break;
-                    case AMY_MIDI: amy_send_midi_note_off(osc); break;
                     case CUSTOM: custom_note_off(osc); break;
                     case BYO_PARTIALS:
                     case INTERP_PARTIALS:
@@ -2241,7 +2249,6 @@ SAMPLE render_osc_wave(uint16_t osc, uint8_t core, SAMPLE* buf) {
                 if(synth[osc]->wave == AUDIO_IN1) max_val = render_audio_in(buf, osc, 1);
                 if(synth[osc]->wave == AUDIO_EXT0) max_val = render_external_audio_in(buf, osc, 0);
                 if(synth[osc]->wave == AUDIO_EXT1) max_val = render_external_audio_in(buf, osc, 1);
-                if(synth[osc]->wave == AMY_MIDI) max_val = 1;
                 if(synth[osc]->wave == KS) {
                     if(amy_global.config.ks_oscs) {
                         max_val = render_ks(buf, osc);
@@ -2660,7 +2667,8 @@ int16_t * amy_fill_buffer() {
 
             // TODO -- the esp stuff here could sit outside of AMY
             // For some reason, have to drop a bit to stop hard wrapping on esp?
-#if defined(ESP_PLATFORM) || defined(__IMXRT1062__)
+            // Not applied on ESP32-P4: see https://github.com/shorepine/amy/issues/1169
+#if (defined(ESP_PLATFORM) && !defined(CONFIG_IDF_TARGET_ESP32P4)) || defined(__IMXRT1062__)
             uintval >>= 1;
 #endif
             if (positive) {

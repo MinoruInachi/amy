@@ -4,6 +4,7 @@ amy-message
 failed_tests.txt
 tests/tst
 tests/test_clock_wrap
+tests/test_filter_type_switch
 tests/test_sequencer_active
 tests/test_sequencer_bounds
 tests/test_sequencer_cumulate
@@ -85,3 +86,4 @@ tests/test_timebase_reset
 tests/test_voice_osc_range
 tests/test_dist_coefs
 tests/test_dist_scope
+tests/test_note_output

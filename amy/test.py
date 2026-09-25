@@ -1563,7 +1563,7 @@ class TestGetSynthCommandsGetsBus(AmyTest):
     expected = """iv4in2Z
 v0f110c1Z
 v1w3f880Z
-y2V0.1x0,0,0M0.5,500,,0,0k0,320,0.5,0.5h0,0.85,0.5,3000Z"""
+y2V0.1x0,0,0M0.5,500,,0,0k0,512,0.5,0.5h0,0.85,0.5,3000Z"""
     if commands != expected:
       is_ok = False
       message = self.__class__.__name__ + ': get_synth_commands mismatch: expected:\n++\n%s\n--\n;saw:\n++\n%s\n--;' % (expected, commands)
@@ -1588,7 +1588,7 @@ class TestGetSynthCommandsGetsMidiCcs(AmyTest):
     expected = """iv4in2Z
 v0f110c1Z
 v1w3f880Z
-y0V1x0,0,0M0,500,,0,0k0,320,0.5,0.5h0,0.85,0.5,3000Z
+y0V1x0,0,0M0,500,,0,0k0,512,0.5,0.5h0,0.85,0.5,3000Z
 ic5,0,0,10,0,helloZ
 ic10,1,1,100,1,i%id%vZ"""
     if commands != expected:
@@ -1618,7 +1618,7 @@ class TestClearMidiCCs(AmyTest):
     expected = """iv4in2Z
 v0f220c1Z
 v1w3f880Z
-y0V1x0,0,0M0,500,,0,0k0,320,0.5,0.5h0,0.85,0.5,3000Z"""
+y0V1x0,0,0M0,500,,0,0k0,512,0.5,0.5h0,0.85,0.5,3000Z"""
     if commands != expected:
       is_ok = False
       message = self.__class__.__name__ + ' : get_synth_commands mismatch: expected:\n++\n%s\n--\n;saw:\n++\n%s\n--;' % (expected, commands)
@@ -1644,7 +1644,7 @@ class TestClearOneMidiCC(AmyTest):
     expected = """iv4in2Z
 v0f220c1Z
 v1w3f880Z
-y0V1x0,0,0M0,500,,0,0k0,320,0.5,0.5h0,0.85,0.5,3000Z
+y0V1x0,0,0M0,500,,0,0k0,512,0.5,0.5h0,0.85,0.5,3000Z
 ic10,1,1,100,1,i%id%vZ"""
     if commands != expected:
       is_ok = False
@@ -2121,8 +2121,8 @@ i1io39,0,0,1,0,i%in40l%vZ
 i2ic255Z
 i2iv1in1y1Z
 i2v0Z
-y0V1x0,0,0M0,500,,0,0k0,320,0.5,0.5h0,0.85,0.5,3000Z
-y1V0.5x0,0,0M0,500,,0,0k0,320,0.5,0.5h0,0.85,0.5,3000Z
+y0V1x0,0,0M0,500,,0,0k0,512,0.5,0.5h0,0.85,0.5,3000Z
+y1V0.5x0,0,0M0,500,,0,0k0,512,0.5,0.5h0,0.85,0.5,3000Z
 """
     if commands != expected:
       is_ok = False
