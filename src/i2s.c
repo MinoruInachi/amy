@@ -88,7 +88,10 @@ i2s_chan_handle_t rx_handle;
 #endif
 
 
-#if !defined(AMYBOARD) && !defined(AMYBOARD_ARDUINO)
+// AMY_I2S_MASTER puts an AMYBOARD build (e.g. the M5Stack StickS3 variant) on
+// this ESP-as-master path, for boards whose codec takes its clocks from the ESP
+// instead of supplying them like AMYboard's PCM9211 does.
+#if (!defined(AMYBOARD) && !defined(AMYBOARD_ARDUINO)) || defined(AMY_I2S_MASTER)
 // default ESP setup i2s
 amy_err_t esp32_setup_i2s(void) {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
