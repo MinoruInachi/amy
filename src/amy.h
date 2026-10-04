@@ -1151,6 +1151,10 @@ int8_t global_init(amy_config_t c);
 void global_deinit();
 void amy_grab_lock();
 void amy_release_lock();
+// Held by the render thread across each block, and by an ingest thread across
+// a patch load; recursive for its owner. Take it before the queue lock.
+void amy_grab_render_lock();
+void amy_release_render_lock();
 void amy_deltas_reset();
 void add_delta_to_queue(struct delta *d, struct delta **queue);
 void amy_add_event_internal(amy_event *e, uint16_t base_osc);
@@ -1210,6 +1214,7 @@ void patches_deinit();
 void parse_algo_source(char* message, int16_t *vals);
 void hold_and_modify(uint16_t osc) ;
 void amy_execute_deltas();
+void amy_settle_deltas();  // due deltas only, any thread: no sequencer tick
 int16_t * amy_fill_buffer();
 int16_t * amy_simple_fill_buffer();  // excute_deltas + render + fill_buffer
 uint32_t ms_to_samples(uint32_t ms) ;
@@ -1313,12 +1318,30 @@ extern void reset_osc(uint16_t i );
 #define MIDI_MAP_TYPE_ANY (-1)
 #define MIDI_MAP_TYPE_CC (0)
 #define MIDI_MAP_TYPE_NOTE (1)
+#define MIDI_MAP_TYPE_CC_OUT (2)  // midi_cc_output (iC): param changes out as CCs
 
 // Value for code (or note) that matches anything
 #define MIDI_MAP_CODE_ANY (-1)
 
 // How many channels we consider for tracking active MIDI channels.
 #define AMY_NUM_MIDI_CHANNELS 16
+
+// A mapping can name AMY parameters directly instead of carrying a wire
+// command: ic<C>,<L>,<N>,<X>,<O>,<P>[,<OSC>][,<P>,<OSC>...] (issue #1175).
+// OSC is voice-relative; a lone P means osc 0 of each voice.
+#define MIDI_MAP_MAX_TARGETS 4
+struct midi_param_target {
+    uint16_t param;  // enum params
+    uint16_t osc;    // voice-relative
+};
+// Can this param be set by a direct mapping?  (see param_fields in midi_mappings.c)
+extern bool amy_param_is_settable(int param);
+// Set the amy_event field for `param` to `value`, in amy.send() units; an
+// osc-scope param also sets e->osc.  False if the param isn't settable.
+extern bool amy_event_set_param(amy_event *e, int param, uint16_t osc, float value);
+// midi_cc_output: send any watched parameter change in this synth event out
+// as a MIDI CC.  Only events headed for `queue == &amy_global.delta_queue` count.
+extern void midi_cc_output_handle_event(amy_event *e, struct delta **queue);
 
 extern int midi_store_mapping(int channel, int type, int code, int is_log, float min_val, float max_val, float offset_val, const char *message, size_t message_len);
 extern int midi_clear_mapping(int channel, int type, int code);
@@ -1356,7 +1379,11 @@ extern void cv_trigger_clear_mappings(int gate_cv);
 // note_output.c -- cv_trigger's mirror: a synth's note events out to
 // CV/gate or MIDI instead of to its oscillators.
 extern uint8_t note_output_mode_for(uint8_t synth);
-extern bool note_output_handle_event(amy_event *e);
+// live: the event is being played (headed for amy_global.delta_queue), not
+// stored into a patch. Only a live event sends anything.
+extern bool note_output_handle_event(amy_event *e, bool live);
+// If synth has a MIDI note output, its channel (1..16) and forward_midi_in.
+extern bool note_output_midi_channel(uint8_t synth, uint8_t *channel, bool *forward_midi_in);
 extern void note_output_config(uint8_t synth, int mode, float *args, int num_args);
 extern void note_output_all_off(uint8_t synth);
 extern void note_output_all_gates_off(void);

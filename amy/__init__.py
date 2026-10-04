@@ -13,7 +13,7 @@ except ImportError:
 # .github/workflows/release.yml, which rewrites the line below in the same commit
 # it tags -- so amy.version always matches the release tag it shipped in. Edit
 # with the workflow, not by hand.
-version = '1.2.180'
+version = '1.2.190'
 
 # BEGIN GENERATED - scripts/gen_amy_c_api.py
 # One backend resolver per C API function: prefer the CPython c_amy
@@ -278,6 +278,7 @@ _KW_MAP_LIST = [   # Order matters because patch_string must come last.
     ('bus', 'yI'), ('mode', 'wwI'),
     ('midi_cc', 'icL'), ('midi_note_cmd', 'ioL'), ('cv_trigger', 'igL'),
     ('note_output', 'iGL'),
+    ('midi_cc_output', 'iCL'),
     ('patch_string', 'uS'),  # patch_string MUST be last because we can't identify when it ends except by end-of-message.
 ]
 _KW_PRIORITY = {k: i for i, (k, _) in enumerate(_KW_MAP_LIST)}   # Maps each key to its index within _KW_MAP_LIST.

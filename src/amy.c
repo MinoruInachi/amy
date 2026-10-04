@@ -92,83 +92,100 @@ void amy_profiles_print() {}
 #include "clipping_lookup_table.h"
 
 
-// Set up the mutex for accessing the queue during rendering (for multicore)
+// Two locks, always taken in this order when both are needed:
+//
+//   render lock  held by the render thread for a whole block (flush, render,
+//                mix), and by an ingest thread for the flush it runs before a
+//                patch load. So a load's frees and resets can't run while a
+//                render is reading oscs. Only the flush, not the load: a load
+//                takes tens of ms on an ESP32-S3, far longer than a block.
+//                Recursive for its owner: a render-thread hook or sequenced
+//                message can load a patch mid-block, and the render thread's
+//                own amy_execute_deltas() takes it inside the block's hold.
+//   queue lock   guards the delta queue itself (add_delta_to_queue, the
+//                flush), held briefly. Ordinary events take only this one, so
+//                a note-on never waits for a render.
+//
+// Each platform supplies a plain lock; the recursion is built on top, below,
+// from a per-thread depth count.
+
+#if defined(_MSC_VER)
+#define AMY_TLS __declspec(thread)
+#else
+#define AMY_TLS _Thread_local
+#endif
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/threading.h>
 #include <emscripten/wasm_worker.h>
-emscripten_lock_t amy_queue_lock = EMSCRIPTEN_LOCK_T_STATIC_INITIALIZER;
-void amy_grab_lock() {
-    emscripten_lock_busyspin_wait_acquire(&amy_queue_lock, 100);
-}
-void amy_release_lock() {
-    emscripten_lock_release(&amy_queue_lock);
-}
-void amy_init_lock() {
-}
+typedef emscripten_lock_t amy_lock_t;
+static void lock_init(amy_lock_t *l) { emscripten_lock_init(l); }
+static void lock_take(amy_lock_t *l) { emscripten_lock_busyspin_wait_acquire(l, 100); }
+static void lock_give(amy_lock_t *l) { emscripten_lock_release(l); }
+#define AMY_THREAD_LOCAL AMY_TLS
 
 #elif defined _WIN32
-CRITICAL_SECTION amy_queue_lock;
-void amy_grab_lock() {
-    EnterCriticalSection(&amy_queue_lock);
-}
-void amy_release_lock() {
-    LeaveCriticalSection(&amy_queue_lock);
-}
-void amy_init_lock() {
-    InitializeCriticalSection(&amy_queue_lock);
-}
-#elif defined _POSIX_THREADS
-pthread_mutex_t amy_queue_lock;
-void amy_grab_lock() {
-    pthread_mutex_lock(&amy_queue_lock);
-}
-void amy_release_lock() {
-    pthread_mutex_unlock(&amy_queue_lock);
-}
-void amy_init_lock() {
-    pthread_mutex_init(&amy_queue_lock, NULL);
-}
-#elif defined ESP_PLATFORM
+typedef CRITICAL_SECTION amy_lock_t;
+static void lock_init(amy_lock_t *l) { InitializeCriticalSection(l); }
+static void lock_take(amy_lock_t *l) { EnterCriticalSection(l); }
+static void lock_give(amy_lock_t *l) { LeaveCriticalSection(l); }
+#define AMY_THREAD_LOCAL AMY_TLS
 
+#elif defined _POSIX_THREADS
+typedef pthread_mutex_t amy_lock_t;
+static void lock_init(amy_lock_t *l) { pthread_mutex_init(l, NULL); }
+static void lock_take(amy_lock_t *l) { pthread_mutex_lock(l); }
+static void lock_give(amy_lock_t *l) { pthread_mutex_unlock(l); }
+#define AMY_THREAD_LOCAL AMY_TLS
+
+#elif defined ESP_PLATFORM
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "esp_rom_sys.h"
-SemaphoreHandle_t amy_queue_lock;
+// A FreeRTOS mutex, so a low-priority task holding it is boosted while the
+// render task waits on it.
+typedef SemaphoreHandle_t amy_lock_t;
+static void lock_init(amy_lock_t *l) { *l = xSemaphoreCreateMutex(); }
+static void lock_take(amy_lock_t *l) { xSemaphoreTake(*l, portMAX_DELAY); }
+static void lock_give(amy_lock_t *l) { xSemaphoreGive(*l); }
+#define AMY_THREAD_LOCAL AMY_TLS
 
-void amy_grab_lock() {
-    xSemaphoreTake(amy_queue_lock, portMAX_DELAY);
-}
-void amy_release_lock() {
-    xSemaphoreGive( amy_queue_lock );
-}
-void amy_init_lock() {
-    amy_queue_lock = xSemaphoreCreateMutex();
-}
 #else
+// Single-threaded (or not yet locked) platforms.
+typedef int amy_lock_t;
+static void lock_init(amy_lock_t *l) { (void)l; }
+static void lock_take(amy_lock_t *l) { (void)l; }
+static void lock_give(amy_lock_t *l) { (void)l; }
+// No threads to tell apart, and no promise of thread-local storage.
+#define AMY_THREAD_LOCAL
+#endif
+
+amy_lock_t amy_queue_lock;   // extern in amy.h on Windows and POSIX
+static amy_lock_t amy_render_lock;
+// How deep this thread is in the render lock. Thread-local, so each thread
+// sees only its own nesting and nothing is shared: > 0 means this thread
+// holds the lock.
+static AMY_THREAD_LOCAL int render_lock_depth = 0;
 
 void amy_grab_lock() {
+    lock_take(&amy_queue_lock);
 }
 void amy_release_lock() {
+    lock_give(&amy_queue_lock);
 }
+
+void amy_grab_render_lock() {
+    if (render_lock_depth++ > 0)  return;   // already ours
+    lock_take(&amy_render_lock);
+}
+void amy_release_render_lock() {
+    if (--render_lock_depth == 0)
+        lock_give(&amy_render_lock);
+}
+
 void amy_init_lock() {
-}
-
-#endif
-
-// A short pause (~100us) for a thread waiting on the renderer, see
-// flush_due_deltas(). Platforms without threads never wait.
-static void amy_wait_briefly() {
-#if defined __EMSCRIPTEN__
-    for (volatile int i = 0; i < 1000; ++i) { }
-#elif defined _WIN32
-    Sleep(1);
-#elif defined _POSIX_THREADS
-    usleep(100);
-#elif defined ESP_PLATFORM
-    esp_rom_delay_us(100);
-#endif
+    lock_init(&amy_queue_lock);
+    lock_init(&amy_render_lock);
 }
 
 
@@ -750,10 +767,9 @@ bool osc_ref_within_voice(int rel_osc, uint16_t oscs_per_voice, const char *what
 
 // For a field naming another osc within the voice (chained_osc, mod_source,
 // and reset_osc when it carries an osc number): range-check it, then offset it
-// by base_osc to reach the real osc. Resets don't allocate what they are about
-// to clear -- reset_osc() is a no-op on an unallocated osc, which is already
-// at its defaults.
-#define EVENT_TO_DELTA_OSC_REF(FIELD, FLAG, WHAT)    if(AMY_IS_SET(e->FIELD)) { if (osc_ref_within_voice((int)e->FIELD, oscs_per_voice, WHAT)) { d.param=FLAG; d.data.i = e->FIELD + base_osc; if (FLAG != RESET_OSC && queue == &amy_global.delta_queue && d.data.i < (uint32_t)AMY_OSCS + amy_global.config.max_buses) ensure_osc_allocd(d.data.i, NULL); add_delta_to_queue(&d, queue); } }
+// by base_osc to reach the real osc. Nothing is allocated here: play_delta
+// ensures the referenced osc when it executes the delta.
+#define EVENT_TO_DELTA_OSC_REF(FIELD, FLAG, WHAT)    if(AMY_IS_SET(e->FIELD)) { if (osc_ref_within_voice((int)e->FIELD, oscs_per_voice, WHAT)) { d.param=FLAG; d.data.i = e->FIELD + base_osc; add_delta_to_queue(&d, queue); } }
 #define EVENT_TO_DELTA_LOG(FIELD, FLAG)             if(AMY_IS_SET(e->FIELD)) { d.param=FLAG; d.data.f = log2f(e->FIELD); add_delta_to_queue(&d, queue);}
 #define EVENT_TO_DELTA_COEFS(FIELD, FLAG)  \
     for (int i = 0; i < NUM_COMBO_COEFS; ++i) \
@@ -800,6 +816,12 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, uint16_t oscs_pe
     // Synth defaults if not set, these are required for the delta struct
     d.time = e->time;
     if(AMY_IS_UNSET(e->time)) { d.time = 0; } 
+
+    // Echo watched parameter changes out as MIDI CCs (midi_cc_output).  Here,
+    // before anything below spends the event: bus-scope distortion fields are
+    // cleared once issued, and bus-only events never reach
+    // patches_event_has_voices at all.
+    if (AMY_IS_SET(e->synth))  midi_cc_output_handle_event(e, queue);
 
     // If this is a bus-directed event, use d->osc to store the bus number instead.
     if (event_addresses_bus(e)) {
@@ -851,8 +873,9 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, uint16_t oscs_pe
     if (!osc_ref_within_voice((int)d.osc, oscs_per_voice, "addressed"))  goto end;
     // First, adapt the osc in this event with base_osc offsets for voices
     d.osc += base_osc;
-    // The osc's synthinfo is allocated below, once the destination queue is
-    // known - see there.
+    // Ingest never allocates the osc's synthinfo: this runs on whichever
+    // thread sent the event, unlocked, while FREE_OSC frees oscs on the
+    // render thread under the lock. play_delta allocates on execution.
 
     // Voices / patches gets set up here 
     // you must set both synth & load_patch together to load a patch 
@@ -860,8 +883,14 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, uint16_t oscs_pe
         if (AMY_IS_SET(e->patch_number) || AMY_IS_SET(e->num_voices) || AMY_IS_SET(e->oscs_per_voice)) {
             // Settle pending deltas without running the sequencer tick
             // service - this can execute on any sending thread (see
-            // flush_due_deltas).
-            flush_due_deltas();
+            // flush_due_deltas). A queued reset has to land before the load
+            // rebuilds the synth tables, or it wipes them afterwards.
+            // The flush runs under the render lock: it can free oscs (a
+            // released voice, a reset) that a render in progress is reading.
+            // The load itself does not: it takes tens of ms on an ESP32-S3
+            // (a 6-voice DX7 load ~50-70 ms), and a render held off that long
+            // runs the DMA ring dry. The flush is µs.
+            amy_settle_deltas();
             patches_load_patch(e);
         }
         // Execute any other commands in this event.
@@ -879,15 +908,6 @@ void amy_event_to_deltas_queue(amy_event *e, uint16_t base_osc, uint16_t oscs_pe
             fprintf(stderr, "event ignored\n");
             goto end;
         }
-    }
-
-    // Ensure the addressed osc's synthinfo only when these deltas are headed
-    // for live execution. Describing an osc - into a stored patch's delta
-    // list or a voice snapshot, both built base-osc-relative - must not
-    // allocate low osc numbers nothing is playing; play_delta ensures at
-    // execution for everything that actually plays.
-    if (queue == &amy_global.delta_queue) {
-        ensure_osc_allocd(d.osc, NULL);
     }
 
     // Everything else only added to queue if set
@@ -2232,10 +2252,20 @@ SAMPLE render_osc_wave(uint16_t osc, uint8_t core, SAMPLE* buf) {
     // Only render if osc has not already been rendered this time step e.g. by chained_osc.
     if (synth[osc]->render_clock != amy_global.total_samples) {
         synth[osc]->render_clock = amy_global.total_samples;
+        if(AMY_IS_SET(synth[osc]->chained_osc)) {
+            // Chained oscillators are rendered into the same buffer, starting with the last one in the chain; tail-recurse.
+            uint16_t chained_osc = synth[osc]->chained_osc;
+            if (synth[chained_osc] != NULL && synth[chained_osc]->status == SYNTH_AUDIBLE) {  // We have to recheck this since we're bypassing the skip in amy_render.
+                SAMPLE new_max_val = render_osc_wave(chained_osc, core, buf);
+                if (new_max_val > max_val)  max_val = new_max_val;
+            }
+        }
         if (synth[osc]->amp_coefs[COEF_CONST] != 0) {
                     // fill buf with next block_size of samples for specified osc.
             hold_and_modify(osc); // apply bp / mod
-            if(!(msynth[osc]->amp == 0 && msynth[osc]->last_amp == 0)) {
+            // A PCM osc renders even at zero amplitude: its read position is time,
+            // so it must keep moving (and reach the end of the sample) while silent.
+            if(!(msynth[osc]->amp == 0 && msynth[osc]->last_amp == 0) || AMY_WAVE_IS_PCM(synth[osc]->wave)) {
                 if(synth[osc]->wave == NOISE) max_val = render_noise(buf, osc);
                 if(synth[osc]->wave == SAW_DOWN) max_val = render_saw_down(buf, osc);
                 if(synth[osc]->wave == SAW_UP) max_val = render_saw_up(buf, osc);
@@ -2266,47 +2296,20 @@ SAMPLE render_osc_wave(uint16_t osc, uint8_t core, SAMPLE* buf) {
         if(AMY_HAS_CUSTOM) {
             if(synth[osc]->wave == CUSTOM) max_val = render_custom(buf, osc);
         }
-        if (synth[osc]->wave != SILENT) {
-            // apply distortion to osc if set, pre-filter; returns its own max
-            // (folding can amplify a quiet release tail).
-            if (synth[osc]->dist_stages) {
-                max_val = dist_process(buf, osc);
-            }
-            // apply filter to osc if set
-            if (synth[osc]->filter_type != FILTER_NONE) {
-                max_val = filter_process(buf, osc, max_val);
-                // Maybe clear filter state here if we've finshed this osc.
-                if (synth[osc]->status != SYNTH_AUDIBLE) {
-                    reset_filter(osc);  // (f)
-                }
-            }
+        // A SILENT osc supplies no waveform, and applies its envelope to summed waveform of the chain below it.
+        if(synth[osc]->wave == SILENT) max_val = render_envelope(buf, osc);
+        // Distortion and Filter *always* apply to the entire chain below.
+        // apply distortion to osc if set, pre-filter; returns its own max
+        // (folding can amplify a quiet release tail).
+        if (synth[osc]->dist_stages) {
+            max_val = dist_process(buf, osc);
         }
-        if(AMY_IS_SET(synth[osc]->chained_osc)) {
-            // Stack oscillators - render next osc into same buffer.
-            uint16_t chained_osc = synth[osc]->chained_osc;
-            if (synth[chained_osc] != NULL && synth[chained_osc]->status == SYNTH_AUDIBLE) {  // We have to recheck this since we're bypassing the skip in amy_render.
-                SAMPLE new_max_val = render_osc_wave(chained_osc, core, buf);
-                if (new_max_val > max_val)  max_val = new_max_val;
-            }
-        }
-        // Unlike other oscs, SILENT osc is processed *after* collecting chained_oscs
-        if (synth[osc]->wave == SILENT) {
-            max_val = render_envelope(buf, osc);
-            // Distortion on a SILENT head shapes the whole voice: buf now holds
-            // the summed chain, and chained_osc is base-osc-relative, so this
-            // runs once per voice on that voice's mix alone.  After the
-            // envelope, so note dynamics drive the shaper as they do per-osc;
-            // before the filter, keeping the per-osc dist -> filter order.
-            if (synth[osc]->dist_stages) {
-                max_val = dist_process(buf, osc);
-            }
-            // apply filter to osc if set
-            if (synth[osc]->filter_type != FILTER_NONE) {
-                max_val = filter_process(buf, osc, max_val);
-                // Maybe clear filter state here if we've finshed this osc.
-                if (synth[osc]->status != SYNTH_AUDIBLE) {
-                    reset_filter(osc);  // (f)
-                }
+        // apply filter to osc if set
+        if (synth[osc]->filter_type != FILTER_NONE) {
+            max_val = filter_process(buf, osc, max_val);
+            // Maybe clear filter state here if we've finshed this osc.
+            if (synth[osc]->status != SYNTH_AUDIBLE) {
+                reset_filter(osc);  // (f)
             }
         }
         // note: Code transplanted here from hold_and_modify() to distinguish actual zero output
@@ -2338,28 +2341,8 @@ SAMPLE render_osc_wave(uint16_t osc, uint8_t core, SAMPLE* buf) {
     return max_val;
 }
 
-// How many amy_render() calls are in flight, on any core; guarded by the
-// queue lock. play_delta() can free or reallocate an osc's storage (FREE_OSC,
-// a reset of all oscs, breakpoint growth) and the renderer reads synth[]
-// without the lock, so a thread that plays deltas outside the rendering
-// context waits for this to reach zero first (see flush_due_deltas()).
-static int amy_renders_in_flight = 0;
-
-static void amy_render_begin() {
-    amy_grab_lock();
-    amy_renders_in_flight++;
-    amy_release_lock();
-}
-
-static void amy_render_end() {
-    amy_grab_lock();
-    amy_renders_in_flight--;
-    amy_release_lock();
-}
-
 AMY_IRAM_ATTR void amy_render(uint16_t start, uint16_t end, uint8_t core) {
     AMY_PROFILE_START(AMY_RENDER)
-    amy_render_begin();
 
     for(int bus = 0; bus <= amy_global.highest_bus; ++bus)
         bzero(fbl[core][bus], sizeof(SAMPLE) * AMY_BLOCK_SIZE * AMY_NCHANS); 
@@ -2434,7 +2417,6 @@ AMY_IRAM_ATTR void amy_render(uint16_t start, uint16_t end, uint8_t core) {
         fprintf(stderr, "time %" PRIu32 " core %d bus 0 max_max=%.3f post-eq max=%.3f\n", amy_global.total_samples, core, S2F(max_max), S2F(smax));
     }
 
-    amy_render_end();
     AMY_PROFILE_STOP(AMY_RENDER)
 
 }
@@ -2446,28 +2428,10 @@ AMY_IRAM_ATTR void amy_render(uint16_t start, uint16_t end, uint8_t core) {
 // service is rendering-context-only (unguarded RMW on next_amy_tick_us, and
 // the external hook expects audio-thread context). Everything here is under
 // the queue lock - safe from any thread.
-// Longest a flush waits for a render in flight, in amy_wait_briefly() steps
-// (~50 ms). Bounded so a delta played from inside a render hook cannot wait
-// on its own render forever.
-#define AMY_FLUSH_WAIT_MAX_STEPS 500
-
 static void flush_due_deltas() {
     // check to see which sounds to play
     uint32_t sysclock = amy_sysclock();
     amy_grab_lock();
-
-    // Deltas can free osc storage that a render in progress on another thread
-    // is reading: a synth reloaded from the sending thread while its notes
-    // still sound runs the released voices' FREE_OSCs here, under the
-    // renderer, which then faults on synth[osc] == NULL. Let in-flight
-    // renders finish first; holding the lock keeps new ones from starting
-    // until the deltas are played. On the render thread itself nothing is in
-    // flight, so this costs one compare.
-    for (int waited = 0; amy_renders_in_flight > 0 && waited < AMY_FLUSH_WAIT_MAX_STEPS; ++waited) {
-        amy_release_lock();
-        amy_wait_briefly();
-        amy_grab_lock();
-    }
 
     // find any deltas that need to be played from the (in-order) queue
     struct delta *d = amy_global.delta_queue;
@@ -2481,6 +2445,17 @@ static void flush_due_deltas() {
     amy_release_lock();
 }
 
+// Play the deltas that are due, from any thread, without advancing the
+// sequencer: what ingest calls before an operation that a queued reset must
+// not land after (a patch load rebuilding the synth tables, a sample load
+// that amy_reset_oscs() would unload). Under the render lock, because the
+// flush can free oscs a render in progress is reading.
+void amy_settle_deltas() {
+    amy_grab_render_lock();
+    flush_due_deltas();
+    amy_release_render_lock();
+}
+
 // this takes scheduled deltas and plays them at the right time
 void amy_execute_deltas() {
     AMY_PROFILE_START(AMY_EXECUTE_DELTAS)
@@ -2489,7 +2464,10 @@ void amy_execute_deltas() {
     sequencer_check_and_fill();
     // Make sure any CV-triggered events are added to delta queue
     update_external_cv_in();
-    flush_due_deltas();
+    // Render loops already hold the render lock across the whole block (it's
+    // recursive for them); amy_settle_deltas() takes it anyway, for render
+    // loops that call this before taking it for the render itself.
+    amy_settle_deltas();
     AMY_PROFILE_STOP(AMY_EXECUTE_DELTAS)
 
 }

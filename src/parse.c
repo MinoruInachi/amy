@@ -346,6 +346,8 @@ int parse_midi_mapping_payload(char *message, int32_t *p_code, int32_t *p_is_log
 int midi_mapping_from_message(char *message, char cmd, int instr_num, int skip_chars) {
     // MIDI CC mapping ic<C>,<L>,<N>,<X>,<O>,<CODE>, see https://github.com/shorepine/amy/issues/524
     // ic255 clears all MIDI CC mappings for this synth (short form, no extra fields needed).
+    // iC<C>,<L>,<N>,<X>,<O>,<P>[,<OSC>]... is the converse, midi_cc_output (#1175): changes
+    // to P are sent out as CC C.  iC<C> alone clears it, iC255 clears them all.
     size_t pos = 0;
     size_t mlen = strlen(message);
     // An empty payload ("ic"/"io" at end of message) would return -1 below,
@@ -369,7 +371,7 @@ int midi_mapping_from_message(char *message, char cmd, int instr_num, int skip_c
         // Parse the fragment.
         int32_t code, is_log;
         float min_val = 0, max_val = 0, offset_val = 0;
-        int type = (cmd == 'c') ? MIDI_MAP_TYPE_CC : MIDI_MAP_TYPE_NOTE;
+        int type = (cmd == 'c') ? MIDI_MAP_TYPE_CC : ((cmd == 'C') ? MIDI_MAP_TYPE_CC_OUT : MIDI_MAP_TYPE_NOTE);
         AMY_UNSET(code);
         AMY_UNSET(is_log);
         skip_chars = parse_midi_mapping_payload(message + pos, &code, &is_log, &min_val, &max_val, &offset_val);
@@ -513,7 +515,7 @@ int amy_parse_synth_layer_message(char *message, amy_event *e) {
     else if (cmd == 'v')  e->num_voices = atoi(message);
     else if (cmd == 'V')  e->synth_level = atoff(message);  // Per-instrument level, default 1.
     else if (cmd == 'y')  e->bus = atoi(message);  // 'i1iy1' is the same as 'i1y1'.
-    else if (cmd == 'c' || cmd == 'o') skip_chars = midi_mapping_from_message(message, cmd, e->synth, skip_chars);
+    else if (cmd == 'c' || cmd == 'o' || cmd == 'C') skip_chars = midi_mapping_from_message(message, cmd, e->synth, skip_chars);  // C: midi_cc_output
     else fprintf(stderr, "Unrecognized synth-level command '%s'\n", message - 1);
     return skip_chars;
 }
@@ -586,7 +588,11 @@ uint16_t amy_parse_transfer_layer_message(char *message) {
         if(sm[1]==0) { // remove preset
             pcm_unload_preset(sm[0]);
         } else {
-            amy_execute_deltas();
+            // A queued reset must land before the load, or amy_reset_oscs()
+            // unloads the new sample when it plays (pcm_unload_all_presets).
+            // Only the flush: this runs on the sending thread, and advancing
+            // the sequencer here would race the render thread's own tick.
+            amy_settle_deltas();
             int16_t * ram = pcm_load(sm[0], sm[1], sm[2], 1, midinote, sm[4], sm[5]);
             start_receiving_transfer(sm[1]*2, (uint8_t*)ram);
         }

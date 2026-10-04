@@ -966,9 +966,14 @@ void *yield_synth_commands(uint8_t instr_num, char *s, size_t len, bool include_
         bool found = false;
         int type = MIDI_MAP_TYPE_CC;
         int starting_code = state_val - STATE_START_OF_MIDI_TPLT_CMDS;
-        for (int next_code = starting_code; next_code < 256; ++next_code) {
+        // codes 0..127 are CC inputs (ic), 128..255 note commands (io),
+        // 256..383 CC outputs (iC).
+        for (int next_code = starting_code; next_code < 384; ++next_code) {
             int next_midi_code = next_code;
-            if (next_midi_code >= 128) {
+            if (next_midi_code >= 256) {
+                next_midi_code -= 256;
+                type = MIDI_MAP_TYPE_CC_OUT;
+            } else if (next_midi_code >= 128) {
                 next_midi_code -= 128;
                 type = MIDI_MAP_TYPE_NOTE;
             }
@@ -1279,7 +1284,7 @@ void patches_event_has_voices(amy_event *e, struct delta **queue) {
     // here -- and why the existence check passes a NULL tag, since
     // "synth N not defined" three times per note would be noise about a
     // deliberate arrangement.
-    if (note_output_handle_event(e) && !instrument_number_exists(e->synth, NULL))
+    if (note_output_handle_event(e, queue == &amy_global.delta_queue) && !instrument_number_exists(e->synth, NULL))
         return;
 
     uint8_t synth = e->synth;
