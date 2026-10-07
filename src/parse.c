@@ -894,8 +894,21 @@ int amy_parse_message(char * message, amy_event *e) {
                 // time=/ticks= like the rest of the API.
                 if (e->reset_osc & (RESET_AMY | RESET_EVENTS)) {
                     if(e->reset_osc & RESET_AMY) {
+                        // Under the render lock. amy_stop() -> oscs_deinit()
+                        // frees fbl, per_osc_fb, every osc and the delta pool,
+                        // and this runs on whichever thread sent the message --
+                        // so without the lock a render in flight on another
+                        // core reads freed memory. amy_platform_deinit() does
+                        // delete AMY's *own* render tasks first, which is why
+                        // this never showed up on hosts that render inside
+                        // them; a host with its own render loop (Tulip's Tab5
+                        // audio task) AMY cannot stop, and there it crashed in
+                        // amy_render on a NULL fbl. The lock survives the
+                        // restart because amy_init_lock() only builds it once.
+                        amy_grab_render_lock();
                         amy_stop();
                         amy_start(amy_global.config);
+                        amy_release_render_lock();
                     }
                     if(e->reset_osc & RESET_EVENTS) {
                         amy_deltas_reset();

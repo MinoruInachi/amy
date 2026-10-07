@@ -183,7 +183,17 @@ void amy_release_render_lock() {
         lock_give(&amy_render_lock);
 }
 
+// Once per process, not once per amy_start(). global_init() calls this on every
+// start, and re-running lock_init() would replace the two handles: on FreeRTOS
+// that leaked a mutex per restart, and -- worse -- it made the locks useless for
+// guarding the restart itself. RESET_AMY now holds the render lock across
+// amy_stop()/amy_start() (see parse.c), and a thread blocked on the old handle
+// would never be released once a new one took its place. The locks hold no
+// AMY state, so keeping them across a restart costs nothing.
 void amy_init_lock() {
+    static int locks_inited = 0;
+    if (locks_inited) return;
+    locks_inited = 1;
     lock_init(&amy_queue_lock);
     lock_init(&amy_render_lock);
 }
