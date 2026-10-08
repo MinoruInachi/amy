@@ -1576,8 +1576,12 @@ extern SAMPLE scan_max(SAMPLE* block, int len);
 #endif
 #define AMY_RENDER_TASK_COREID (0)
 #define AMY_FILL_BUFFER_TASK_COREID (1)
+#ifndef AMY_RENDER_TASK_STACK_SIZE
 #define AMY_RENDER_TASK_STACK_SIZE (12 * 1024) // 8
+#endif
+#ifndef AMY_FILL_BUFFER_TASK_STACK_SIZE
 #define AMY_FILL_BUFFER_TASK_STACK_SIZE (16 * 1024) // 16
+#endif
 #define AMY_RENDER_TASK_NAME      "amy_r_task"
 #define AMY_FILL_BUFFER_TASK_NAME "amy_fb_task"
 #include "esp_err.h"

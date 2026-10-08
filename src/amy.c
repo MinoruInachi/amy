@@ -2722,7 +2722,9 @@ struct delta *free_deltas_pool = NULL;
 struct delta *delta_blocks[MAX_DELTA_BLOCKS];
 int next_delta_block = 0;
 
+#ifndef DELTA_BLOCK_SIZE
 #define DELTA_BLOCK_SIZE 2048
+#endif
 
 struct delta *deltas_pool_alloc(int max_delta_pool_size, struct delta *tail) {
     struct delta *new_pool = (struct delta *)malloc_caps(max_delta_pool_size * sizeof(struct delta),

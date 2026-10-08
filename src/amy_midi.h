@@ -60,7 +60,9 @@ void midi_active_channels_debug(void);
 #define MAX_MIDI_BYTES_TO_PARSE 1024
 #define MAX_MIDI_BYTES_PER_MESSAGE 3
 #define MIDI_QUEUE_DEPTH 1024
+#ifndef MAX_SYSEX_BYTES
 #define MAX_SYSEX_BYTES (16384)
+#endif
 extern uint8_t *sysex_buffer;
 // Every platform allocates the single sysex_buffer above. The sysex copy-slot
 // ring buffer below holds backup snapshots so a fast-arriving message isn't lost
